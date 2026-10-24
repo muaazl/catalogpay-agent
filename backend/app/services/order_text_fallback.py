@@ -18,10 +18,10 @@ import re
 from pydantic import ValidationError
 
 from app.schemas.order_parser import ExtractedLineItem, GeminiExtractionPayload
+from app.services.sku_matcher import UNIT_ALTERNATION
 
 MAX_QUANTITY = 10_000
 
-_SPLIT_RE = re.compile(r"\r?\n|;|\||,(?!\d)|\s+(?:and|plus|&|\+)\s+(?=(?:\d|a\s|an\s))", re.I)
 _BULLET_RE = re.compile(r"^\s*(?:[-*•·▪◦‣>]+|\(?\d{1,2}[.)])\s+")
 _NOTES_RE = re.compile(r"\(([^()]{1,200})\)")
 
@@ -29,12 +29,20 @@ _PACK = (
     r"bags?|box(?:es)?|cases?|packs?|packets?|tins?|bottles?|sacks?|cartons?|units?|pcs|"
     r"pieces?|jars?|tubs?|crates?|blocks?|rolls?|pallets?"
 )
-_MEASURE_UNITS = r"kg|kgs|kilos?|g|gr|grams?|lbs?|l|lt|ltr|litres?|liters?|ml|oz|mm|cm"
+# Same vocabulary the matcher canonicalizes ("gm", "milliliter", "pounds", ...), so a size such as
+# "500 gm" or "600 milliliter" is never mistaken for the order multiplier.
+_MEASURE_UNITS = UNIT_ALTERNATION
 _NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
     "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20,
 }  # fmt: skip
 _NUM_WORD_ALT = "|".join(_NUMBER_WORDS)
+# Conjunctions split lines only when a new quantity follows: "2x arabica and three tampers".
+_SPLIT_RE = re.compile(
+    r"\r?\n|;|\||,(?!\d)|\s+(?:and|plus|&|\+)\s+"
+    rf"(?=(?:\d|(?:an?|half|dozen|{_NUM_WORD_ALT})\b))",
+    re.I,
+)
 _Q = r"\d{1,6}"
 _TIMES = r"(?:x|\u00d7|\*)(?![a-z])"
 
