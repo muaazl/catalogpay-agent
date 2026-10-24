@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from app.services.sku_matcher import MatchStatus
 
@@ -64,8 +64,10 @@ class HealthResponse(BaseModel):
 
 
 class MatchPreviewItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     query: str = Field(min_length=1, max_length=500, examples=["arabica beans half kg"])
-    quantity: int = Field(ge=1, le=100_000, examples=[4])
+    quantity: StrictInt = Field(ge=1, le=100_000, examples=[4])
 
     @field_validator("query")
     @classmethod
@@ -76,8 +78,10 @@ class MatchPreviewItem(BaseModel):
 
 
 class MatchPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     items: list[MatchPreviewItem] = Field(min_length=1, max_length=100)
-    top_k: int = Field(default=3, ge=1, le=10)
+    top_k: StrictInt = Field(default=3, ge=1, le=10)
 
 
 class StockStatus(StrEnum):
