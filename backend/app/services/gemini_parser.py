@@ -20,6 +20,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.core.errors import DomainError
 from app.schemas.order_parser import ExtractedLineItem, GeminiExtractionPayload
 
 logger = logging.getLogger(__name__)
@@ -97,13 +98,9 @@ _MEDIA_PROMPT: Final = (
 # --------------------------------------------------------------------------------------------
 
 
-class OrderParserError(Exception):
+class OrderParserError(DomainError):
     status_code: int = 500
     code: str = "order_parser_error"
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
 
 
 class ParserNotConfiguredError(OrderParserError):
@@ -194,6 +191,45 @@ def _fence(text: str) -> str:
     )
 
 
+def _coerce_fragments(value: Any) -> list[str]:
+    """Accept a list of strings or a single string; anything else (int, bool, dict) -> []."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list | tuple):
+        return []
+    out: list[str] = []
+    for fragment in value:
+        if isinstance(fragment, bool) or not isinstance(fragment, str | int | float):
+            continue
+        text = str(fragment).strip()
+        if text:
+            out.append(text[:1000])
+    return out
+
+
+def _coerce_quantity(value: Any) -> int | None:
+    """Only genuine integers survive. ``True`` is not 1 and ``2.5`` is not 2."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():  # JSON may encode 2 as 2.0
+        return int(value)
+    return None
+
+
+def _coerce_item(entry: Any) -> ExtractedLineItem | None:
+    if not isinstance(entry, dict):
+        return None
+    quantity = _coerce_quantity(entry.get("quantity"))
+    if quantity is None:
+        return None
+    try:
+        return ExtractedLineItem.model_validate({**entry, "quantity": quantity}, strict=True)
+    except ValidationError:
+        return None
+
+
 def coerce_payload(raw: Any) -> GeminiExtractionPayload:
     """Validate model output item by item. Bad items become unrecognized fragments.
 
@@ -210,18 +246,13 @@ def coerce_payload(raw: Any) -> GeminiExtractionPayload:
         raise UpstreamResponseError("Gemini response did not match the extraction schema.")
 
     items: list[ExtractedLineItem] = []
-    unrecognized = [
-        str(f)[:1000] for f in (raw.get("unrecognized_fragments") or []) if isinstance(f, str | int)
-    ]
+    unrecognized = _coerce_fragments(raw.get("unrecognized_fragments"))
     for entry in raw["items"]:
-        try:
-            item = ExtractedLineItem.model_validate(entry, strict=False)
-        except ValidationError:
+        item = _coerce_item(entry)
+        if item is None:
             text = entry.get("raw_line_text") if isinstance(entry, dict) else None
-            unrecognized.append(str(text or entry)[:1000])
-            continue
-        if not item.search_query.strip():
-            unrecognized.append(item.raw_line_text)
+            fallback = str(text if isinstance(text, str) and text.strip() else entry)
+            unrecognized.append(fallback.strip()[:1000])
             continue
         items.append(item)
 
