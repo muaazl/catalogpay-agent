@@ -2,13 +2,15 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from app.schemas.catalog import MatchPreviewResponse
 
 
 class ExtractedLineItem(BaseModel):
     """One purchasable line pulled out of the buyer's message. Never carries a price."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
 
     raw_line_text: str = Field(
         max_length=1000, description="The original fragment of buyer input for this line."
@@ -21,11 +23,16 @@ class ExtractedLineItem(BaseModel):
             "'3 bags of 500g arabica' -> 'arabica 500g'."
         ),
     )
-    quantity: int = Field(ge=1, le=10_000, description="How many units the buyer wants.")
+    quantity: StrictInt = Field(ge=1, le=10_000, description="How many units the buyer wants.")
     unit_hint: str | None = Field(
         default=None, max_length=100, description="Packaging word, e.g. 'bags', 'cases'."
     )
     notes: str | None = Field(default=None, max_length=500)
+
+    @field_validator("unit_hint", "notes")
+    @classmethod
+    def _blank_to_none(cls, value: str | None) -> str | None:
+        return value or None
 
 
 class GeminiExtractionPayload(BaseModel):
