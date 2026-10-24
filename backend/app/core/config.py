@@ -36,10 +36,38 @@ class Settings(BaseSettings):
     gemini_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, ge=1, le=50 * 1024 * 1024)
 
+    # PayPal. Without client credentials and with the mock fallback on, the client runs in
+    # deterministic ``sandbox_simulation`` mode (SIM-ORDER-... / SIM-PAYOUT-... ids).
+    paypal_client_id: str = Field(default="", repr=False)
+    paypal_client_secret: str = Field(default="", repr=False)
+    paypal_env: Literal["sandbox", "live"] = "sandbox"
+    paypal_base_url: str = "https://api-m.sandbox.paypal.com"
+    paypal_webhook_id: str = ""
+    paypal_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    paypal_sandbox_mock_fallback: bool = True
+    paypal_return_url: str = "http://localhost:5173/checkout/return"
+    paypal_cancel_url: str = "http://localhost:5173/checkout/cancel"
+    paypal_brand_name: str = Field(default="CatalogPay", max_length=127)
+    # Signs simulated webhooks so the simulation endpoint cannot be trivially forged.
+    paypal_simulation_secret: str = Field(default="catalogpay-local-simulation", repr=False)
+
+    @property
+    def paypal_credentials_configured(self) -> bool:
+        return bool(self.paypal_client_id.strip() and self.paypal_client_secret.strip())
+
     @model_validator(mode="after")
     def _check_thresholds(self) -> "Settings":
         if self.low_confidence_threshold > self.match_confidence_threshold:
             raise ValueError("LOW_CONFIDENCE_THRESHOLD must not exceed MATCH_CONFIDENCE_THRESHOLD")
+        return self
+
+    @model_validator(mode="after")
+    def _check_paypal(self) -> "Settings":
+        if not self.paypal_base_url.startswith("https://"):
+            raise ValueError("PAYPAL_BASE_URL must use https")
+        is_sandbox_url = "sandbox" in self.paypal_base_url
+        if (self.paypal_env == "live") == is_sandbox_url:
+            raise ValueError("PAYPAL_ENV and PAYPAL_BASE_URL disagree (sandbox vs live)")
         return self
 
 
