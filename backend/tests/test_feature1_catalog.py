@@ -1,5 +1,6 @@
 """Feature 1: foundation, financial schema, seed catalog, hybrid SKU matcher, catalog API."""
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -11,10 +12,12 @@ from sqlalchemy.orm import Session
 from app.db.session import build_engine, get_db
 from app.models.catalog import ProductSKU, Vendor
 from app.schemas.catalog import MatchPreviewItem
-from app.services.money import line_subtotal_cents, platform_fee_cents, split_fee
+from app.services import seed as seed_module
+from app.services.money import allocate_fee, line_subtotal_cents, platform_fee_cents, split_fee
 from app.services.order_preview import build_match_preview
 from app.services.seed import SKU_SEED, VENDOR_SEED, seed_catalog
 from app.services.sku_matcher import (
+    MAX_QUERY_CHARS,
     CharNgramTfidf,
     HybridSKUMatcher,
     MatchStatus,
@@ -607,3 +610,208 @@ class TestMatchPreviewEndpoint:
     )
     def test_validation_errors(self, client: TestClient, payload):
         assert client.post(self.URL, json=payload).status_code == 422
+
+
+# =============================================================================================
+# Review remediation regressions
+# =============================================================================================
+
+
+class TestReviewRegressions:
+    # --- matcher input hardening ---------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "query",
+        ["9" * 310 + "lb", "9" * 310 + "kg 5", "1" * 5000, "beans " * 400, "0." + "9" * 400 + "kg"],
+    )
+    def test_pathological_numbers_and_lengths_do_not_raise(self, matcher, query):
+        result = matcher.match(query)
+        assert result.status in set(MatchStatus)
+        assert len(result.query) <= MAX_QUERY_CHARS
+        assert not any(len(m) > 14 for m in extract_measures(result.normalized_query))
+
+    def test_overlong_digit_run_is_not_a_measure(self):
+        assert extract_measures(normalize_text("9" * 310 + "lb")) == frozenset()
+        assert extract_measures(normalize_text("12345678kg")) == frozenset()
+
+    def test_api_rejects_overlong_query_without_500(self, client: TestClient):
+        resp = client.post(
+            "/api/v1/catalog/match-preview", json={"items": [{"query": "x" * 1001, "quantity": 1}]}
+        )
+        assert resp.status_code == 422
+        resp = client.post(
+            "/api/v1/catalog/match-preview",
+            json={"items": [{"query": "9" * 310 + "lb", "quantity": 1}]},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["lines"][0]["match_status"] == "unmatched"
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("1,000g", "1000g"),
+            ("1,000,000g", "1000000g"),
+            ("2,500 g", "2500g"),
+            ("1,5kg", "1500g"),
+            ("0,5 kg", "500g"),
+            ("2,50kg", "2500g"),
+            ("1.5l", "1500ml"),
+            ("1 lb", "453.6g"),
+        ],
+    )
+    def test_thousands_vs_decimal_commas_and_decimal_measures(self, raw, expected):
+        assert extract_measures(normalize_text(raw)) == {expected}
+
+    def test_thousands_comma_query_matches_1kg_sku(self, matcher: HybridSKUMatcher):
+        result = matcher.match("colombian arabica 1,000g")
+        assert result.status is MatchStatus.MATCHED
+        assert result.best.entry.sku_code == "SPR-COF-ARB-1KG"
+        assert result.best.unit_score == 1.0  # no conflict penalty
+        assert result.best.confidence_score >= 0.8
+
+    @pytest.mark.parametrize(
+        "query", ["%%%", "% % %", "\U0001f525\U0001f525\U0001f525", "☕\U0001f950", "%_%"]
+    )
+    def test_symbol_and_emoji_only_queries(self, matcher: HybridSKUMatcher, query):
+        assert normalize_text(query) == ""
+        result = matcher.match(query)
+        assert result.status is MatchStatus.UNMATCHED and result.candidates == ()
+
+    def test_percent_is_stripped_but_number_kept(self):
+        assert normalize_text("butter 82%") == "butter 82"
+
+    # --- money strictness & vendor-level rounding ----------------------------------------
+
+    @pytest.mark.parametrize("bad", [True, False, 1.5, "100", Decimal("100"), None])
+    def test_money_rejects_non_int(self, bad):
+        with pytest.raises(TypeError):
+            platform_fee_cents(bad, 500)
+        with pytest.raises(TypeError):
+            platform_fee_cents(100, bad)
+        with pytest.raises(TypeError):
+            line_subtotal_cents(bad, 1)
+        with pytest.raises(TypeError):
+            split_fee(bad, 500)
+        with pytest.raises(TypeError):
+            allocate_fee([100, bad], 500)
+
+    def test_allocate_fee_matches_fee_on_combined_subtotal(self):
+        # Per-line rounding would charge 449 + 449 = 898; the vendor owes 897 on 13800.
+        assert allocate_fee([6900, 6900], 650) == [449, 448]
+        for bps in (0, 1, 450, 500, 650, 800, 3333, 9999, 10_000):
+            for parts in ([1], [1, 1, 1], [6900, 6900], [7, 13, 1999, 5], [0, 0], [], [99_999] * 4):
+                fees = allocate_fee(parts, bps)
+                assert sum(fees) == platform_fee_cents(sum(parts), bps)
+                assert all(0 <= f <= p for f, p in zip(fees, parts, strict=True))
+
+    def test_split_lines_and_combined_line_charge_identical_vendor_fee(self, matcher):
+        split = build_match_preview(
+            matcher,
+            [MatchPreviewItem(query="sip lids 12oz", quantity=1)] * 2,
+            currency="USD",
+        )
+        combined = build_match_preview(
+            matcher, [MatchPreviewItem(query="sip lids 12oz", quantity=2)], currency="USD"
+        )
+        (vs,), (vc,) = split.vendor_payouts, combined.vendor_payouts
+        assert vs.subtotal_cents == vc.subtotal_cents == 13_800
+        assert vs.platform_fee_cents == vc.platform_fee_cents == 897
+        assert vs.net_vendor_payout_cents == vc.net_vendor_payout_cents == 12_903
+        assert sum(ln.platform_fee_cents for ln in split.lines) == vs.platform_fee_cents
+        for ln in split.lines:
+            assert ln.subtotal_cents == ln.platform_fee_cents + ln.net_vendor_payout_cents
+
+    # --- seeding --------------------------------------------------------------------------
+
+    def test_reseed_preserves_live_stock_and_active_flags(self, seeded_session: Session):
+        sku = seeded_session.scalar(select(ProductSKU).where(ProductSKU.sku_code == "GCB-YST-500G"))
+        dropped = seeded_session.scalar(
+            select(ProductSKU).where(ProductSKU.sku_code == "GLP-STR-500")
+        )
+        sku.stock_quantity = 7
+        dropped.is_active = False
+        seeded_session.commit()
+
+        report = seed_catalog(seeded_session)
+        assert report.skus_updated == 0
+        seeded_session.refresh(sku)
+        seeded_session.refresh(dropped)
+        assert sku.stock_quantity == 7
+        assert dropped.is_active is False
+
+        seed_catalog(seeded_session, reset_stock=True)
+        seeded_session.refresh(sku)
+        assert sku.stock_quantity == 100
+
+    def test_seed_retries_after_concurrent_insert(self, session: Session, monkeypatch):
+        real = seed_module._seed_once
+        calls = {"n": 0}
+
+        def racing(sess, *, reset_stock):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                real(sess, reset_stock=reset_stock)  # the "other" process wins the race
+                raise IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed"))
+            return real(sess, reset_stock=reset_stock)
+
+        monkeypatch.setattr(seed_module, "_seed_once", racing)
+        report = seed_catalog(session)
+        assert calls["n"] == 2
+        assert report.vendors_created == report.skus_created == 0
+        assert session.scalar(select(func.count()).select_from(ProductSKU)) == 25
+
+    def test_seed_gives_up_after_max_attempts(self, session: Session, monkeypatch):
+        def always_conflict(sess, *, reset_stock):
+            raise IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed"))
+
+        monkeypatch.setattr(seed_module, "_seed_once", always_conflict)
+        with pytest.raises(IntegrityError):
+            seed_catalog(session, max_attempts=2)
+
+    # --- API: health, LIKE escaping, strict schemas ---------------------------------------
+
+    def test_health_excludes_skus_of_inactive_vendors(self, client, seeded_session: Session):
+        vendor = seeded_session.scalar(
+            select(Vendor).where(
+                Vendor.paypal_merchant_email == "vendor-packaging@sandbox.paypal.com"
+            )
+        )
+        vendor.is_active = False
+        seeded_session.commit()
+        assert client.get("/api/v1/health").json()["active_sku_count"] == 25 - 6
+
+    @pytest.mark.parametrize(
+        "term,expected_codes",
+        [
+            ("100%", set()),  # unescaped "%100%%" would match every "...-100" SKU
+            ("82%", {"GCB-BTR-SHT-1KG"}),  # literal percent in "Butter Sheets 82%"
+            ("_", set()),  # unescaped "_" matches any character
+            ("GLP_CUP", set()),  # unescaped would match "GLP-CUP-12OZ-1000"
+            # Literal "%" only hits rows that really contain one (unescaped: all 25 rows).
+            ("%", {"GCB-BTR-SHT-1KG", "GCB-CHC-DRK-2500G", "GCB-FLR-BRD-25KG"}),
+            ("\\", set()),
+            ("GLP-CUP", {"GLP-CUP-12OZ-1000"}),
+        ],
+    )
+    @pytest.mark.parametrize("param", ["search", "q"])
+    def test_sku_search_escapes_like_wildcards(self, client, param, term, expected_codes):
+        body = client.get("/api/v1/catalog/skus", params={param: term}).json()
+        assert {i["sku_code"] for i in body["items"]} == expected_codes
+
+    def test_vendor_filter_escapes_like_wildcards(self, client: TestClient):
+        assert client.get("/api/v1/catalog/skus", params={"vendor": "%"}).json()["total"] == 0
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"items": [{"query": "beans", "quantity": "3"}]},
+            {"items": [{"query": "beans", "quantity": True}]},
+            {"items": [{"query": "beans", "quantity": 3.0}]},
+            {"items": [{"query": "beans", "quantity": 1}], "top_k": "3"},
+            {"items": [{"query": "beans", "quantity": 1}], "top_k": True},
+            {"items": [{"query": "beans", "quantity": 1, "unit_price_cents": 1}]},
+            {"items": [{"query": "beans", "quantity": 1}], "discount": 100},
+        ],
+    )
+    def test_strict_request_schema(self, client: TestClient, payload):
+        assert client.post("/api/v1/catalog/match-preview", json=payload).status_code == 422
