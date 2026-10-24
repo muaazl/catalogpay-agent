@@ -1,7 +1,14 @@
-"""Builds a priced, stock-checked, vendor-split preview from raw buyer line items."""
+"""Builds a priced, stock-checked, vendor-split preview from raw buyer line items.
+
+Two passes: (1) resolve every line to a SKU and check stock, (2) per vendor, charge the platform
+fee once on the vendor subtotal and apportion it to that vendor's lines. Every level (line,
+vendor, order) satisfies ``subtotal == platform_fee + net_vendor_payout`` exactly, and the
+vendor fee does not depend on how the buyer split their lines.
+"""
 
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 from app.schemas.catalog import (
     CandidateOut,
@@ -13,8 +20,8 @@ from app.schemas.catalog import (
     VendorPayoutPreview,
     VendorSummary,
 )
-from app.services.money import line_subtotal_cents, split_fee
-from app.services.sku_matcher import HybridSKUMatcher, MatchCandidate, MatchStatus
+from app.services.money import allocate_fee, line_subtotal_cents
+from app.services.sku_matcher import CatalogEntry, HybridSKUMatcher, MatchCandidate, MatchStatus
 
 
 def _candidate_out(candidate: MatchCandidate) -> CandidateOut:
@@ -38,6 +45,77 @@ def _candidate_out(candidate: MatchCandidate) -> CandidateOut:
     )
 
 
+@dataclass(slots=True)
+class _ResolvedLine:
+    index: int
+    item: MatchPreviewItem
+    normalized_query: str
+    status: MatchStatus
+    is_ambiguous: bool
+    candidates: list[CandidateOut]
+    best: MatchCandidate | None
+    stock_status: StockStatus
+    available: int | None
+    issues: list[str] = field(default_factory=list)
+    subtotal_cents: int = 0
+    platform_fee_cents: int = 0
+
+    @property
+    def entry(self) -> CatalogEntry | None:
+        return self.best.entry if self.best is not None else None
+
+    @property
+    def is_billable(self) -> bool:
+        return self.best is not None and not self.issues
+
+
+def _resolve(
+    matcher: HybridSKUMatcher,
+    items: Sequence[MatchPreviewItem],
+    currency: str,
+    top_k: int,
+) -> list[_ResolvedLine]:
+    reserved: defaultdict[int, int] = defaultdict(int)  # sku_id -> qty claimed by earlier lines
+    lines: list[_ResolvedLine] = []
+    for index, item in enumerate(items):
+        result = matcher.match(item.query, top_k=top_k)
+        best = result.best if result.status is MatchStatus.MATCHED else None
+        line = _ResolvedLine(
+            index=index,
+            item=item,
+            normalized_query=result.normalized_query,
+            status=result.status,
+            is_ambiguous=result.is_ambiguous,
+            candidates=[_candidate_out(c) for c in result.candidates],
+            best=best,
+            stock_status=StockStatus.NOT_APPLICABLE,
+            available=None,
+        )
+        if result.status is MatchStatus.UNMATCHED:
+            line.issues.append("No catalog SKU matched this item with sufficient confidence.")
+        elif result.status is MatchStatus.LOW_CONFIDENCE:
+            reason = "candidates are too close to call" if result.is_ambiguous else "low score"
+            line.issues.append(f"Match needs buyer confirmation ({reason}).")
+
+        entry = line.entry
+        if entry is not None:
+            line.available = entry.stock_quantity - reserved[entry.sku_id]
+            if entry.currency != currency:
+                line.issues.append(f"SKU priced in {entry.currency}, order currency is {currency}.")
+            if item.quantity <= line.available:
+                line.stock_status = StockStatus.IN_STOCK
+            else:
+                line.stock_status = StockStatus.INSUFFICIENT_STOCK
+                line.issues.append(
+                    f"Requested {item.quantity}, only {max(line.available, 0)} available."
+                )
+            if line.is_billable:
+                reserved[entry.sku_id] += item.quantity
+                line.subtotal_cents = line_subtotal_cents(entry.unit_price_cents, item.quantity)
+        lines.append(line)
+    return lines
+
+
 def build_match_preview(
     matcher: HybridSKUMatcher,
     items: Sequence[MatchPreviewItem],
@@ -45,102 +123,72 @@ def build_match_preview(
     currency: str,
     top_k: int = 3,
 ) -> MatchPreviewResponse:
-    lines: list[LineItemPreview] = []
-    reserved: defaultdict[int, int] = defaultdict(int)  # sku_id -> qty claimed by earlier lines
-    payouts: dict[int, VendorPayoutPreview] = {}
+    lines = _resolve(matcher, items, currency, top_k)
 
-    for index, item in enumerate(items):
-        result = matcher.match(item.query, top_k=top_k)
-        candidates = [_candidate_out(c) for c in result.candidates]
-        issues: list[str] = []
-        best = result.best if result.status is MatchStatus.MATCHED else None
-        stock_status = StockStatus.NOT_APPLICABLE
-        available: int | None = None
-        unit_price = subtotal = fee = net = bps = 0
+    by_vendor: dict[int, list[_ResolvedLine]] = defaultdict(list)
+    for line in lines:
+        if line.is_billable and line.entry is not None:
+            by_vendor[line.entry.vendor.id].append(line)
 
-        if result.status is MatchStatus.UNMATCHED:
-            issues.append("No catalog SKU matched this item with sufficient confidence.")
-        elif result.status is MatchStatus.LOW_CONFIDENCE:
-            reason = "candidates are too close to call" if result.is_ambiguous else "low score"
-            issues.append(f"Match needs buyer confirmation ({reason}).")
-
-        if best is not None:
-            entry = best.entry
-            available = entry.stock_quantity - reserved[entry.sku_id]
-            if entry.currency != currency:
-                issues.append(f"SKU priced in {entry.currency}, order currency is {currency}.")
-            if item.quantity <= available:
-                stock_status = StockStatus.IN_STOCK
-            else:
-                stock_status = StockStatus.INSUFFICIENT_STOCK
-                issues.append(f"Requested {item.quantity}, only {max(available, 0)} available.")
-
-        is_billable = best is not None and not issues
-        if is_billable and best is not None:
-            entry = best.entry
-            reserved[entry.sku_id] += item.quantity
-            unit_price = entry.unit_price_cents
-            bps = entry.vendor.commission_rate_bps
-            split = split_fee(line_subtotal_cents(unit_price, item.quantity), bps)
-            subtotal, fee, net = (
-                split.subtotal_cents,
-                split.platform_fee_cents,
-                split.net_vendor_payout_cents,
-            )
-            v = entry.vendor
-            agg = payouts.get(v.id) or VendorPayoutPreview(
-                vendor_id=v.id,
-                vendor_name=v.name,
-                paypal_merchant_email=v.paypal_merchant_email,
-                commission_rate_bps=v.commission_rate_bps,
-                line_count=0,
-                subtotal_cents=0,
-                platform_fee_cents=0,
-                net_vendor_payout_cents=0,
-            )
-            payouts[v.id] = agg.model_copy(
-                update={
-                    "line_count": agg.line_count + 1,
-                    "subtotal_cents": agg.subtotal_cents + subtotal,
-                    "platform_fee_cents": agg.platform_fee_cents + fee,
-                    "net_vendor_payout_cents": agg.net_vendor_payout_cents + net,
-                }
-            )
-
-        lines.append(
-            LineItemPreview(
-                line_index=index,
-                query=item.query,
-                normalized_query=result.normalized_query,
-                quantity=item.quantity,
-                match_status=result.status,
-                is_ambiguous=result.is_ambiguous,
-                matched_sku=_candidate_out(best) if best is not None else None,
-                candidates=candidates,
-                stock_status=stock_status,
-                available_quantity=available,
-                is_billable=is_billable,
-                issues=issues,
-                unit_price_cents=unit_price,
+    vendor_payouts: list[VendorPayoutPreview] = []
+    for vendor_id in sorted(by_vendor):
+        vendor_lines = by_vendor[vendor_id]
+        first_entry = vendor_lines[0].entry
+        assert first_entry is not None  # only billable lines with an entry are grouped
+        vendor = first_entry.vendor
+        fees = allocate_fee([ln.subtotal_cents for ln in vendor_lines], vendor.commission_rate_bps)
+        for ln, fee in zip(vendor_lines, fees, strict=True):
+            ln.platform_fee_cents = fee
+        subtotal = sum(ln.subtotal_cents for ln in vendor_lines)
+        fee_total = sum(fees)
+        vendor_payouts.append(
+            VendorPayoutPreview(
+                vendor_id=vendor.id,
+                vendor_name=vendor.name,
+                paypal_merchant_email=vendor.paypal_merchant_email,
+                commission_rate_bps=vendor.commission_rate_bps,
+                line_count=len(vendor_lines),
                 subtotal_cents=subtotal,
-                commission_rate_bps=bps,
-                platform_fee_cents=fee,
-                net_vendor_payout_cents=net,
+                platform_fee_cents=fee_total,
+                net_vendor_payout_cents=subtotal - fee_total,
             )
         )
 
-    vendor_payouts = sorted(payouts.values(), key=lambda p: p.vendor_id)
+    line_previews = [
+        LineItemPreview(
+            line_index=ln.index,
+            query=ln.item.query,
+            normalized_query=ln.normalized_query,
+            quantity=ln.item.quantity,
+            match_status=ln.status,
+            is_ambiguous=ln.is_ambiguous,
+            matched_sku=_candidate_out(ln.best) if ln.best is not None else None,
+            candidates=ln.candidates,
+            stock_status=ln.stock_status,
+            available_quantity=ln.available,
+            is_billable=ln.is_billable,
+            issues=ln.issues,
+            unit_price_cents=ln.entry.unit_price_cents if ln.is_billable and ln.entry else 0,
+            subtotal_cents=ln.subtotal_cents,
+            commission_rate_bps=(
+                ln.entry.vendor.commission_rate_bps if ln.is_billable and ln.entry else 0
+            ),
+            platform_fee_cents=ln.platform_fee_cents,
+            net_vendor_payout_cents=ln.subtotal_cents - ln.platform_fee_cents,
+        )
+        for ln in lines
+    ]
     totals = PreviewTotals(
         subtotal_cents=sum(p.subtotal_cents for p in vendor_payouts),
         platform_fee_cents=sum(p.platform_fee_cents for p in vendor_payouts),
         net_vendor_payout_cents=sum(p.net_vendor_payout_cents for p in vendor_payouts),
     )
-    unresolved = [line.line_index for line in lines if not line.is_billable]
+    unresolved = [ln.index for ln in lines if not ln.is_billable]
     return MatchPreviewResponse(
         currency=currency,
         all_lines_billable=not unresolved,
         unresolved_line_indexes=unresolved,
-        lines=lines,
+        lines=line_previews,
         vendor_payouts=vendor_payouts,
         totals=totals,
     )
