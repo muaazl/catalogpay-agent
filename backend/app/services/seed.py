@@ -4,13 +4,17 @@ Vendors are keyed on ``paypal_merchant_email`` and SKUs on ``sku_code``: re-runn
 updates existing rows in place and never creates duplicates.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.catalog import ProductSKU, Vendor
+
+logger = logging.getLogger(__name__)
 
 ROASTERS = "vendor-roasters@sandbox.paypal.com"
 EQUIPMENT = "vendor-equipment@sandbox.paypal.com"
@@ -336,20 +340,24 @@ def _apply(obj: object, fields: dict[str, Any]) -> bool:
     return changed
 
 
-def seed_catalog(session: Session) -> SeedReport:
-    """Upsert the demo vendors and SKUs. Safe to call any number of times."""
+# Live operational state: written on insert only, never clobbered by a re-seed. Captured orders
+# decrement stock and admins may deactivate rows; a restart must not undo either.
+_INSERT_ONLY_SKU_FIELDS = frozenset({"stock_quantity", "is_active"})
+_INSERT_ONLY_VENDOR_FIELDS = frozenset({"is_active"})
+
+
+def _seed_once(session: Session, *, reset_stock: bool) -> SeedReport:
     vendors_created = vendors_updated = skus_created = skus_updated = 0
 
     existing_vendors = {v.paypal_merchant_email: v for v in session.scalars(select(Vendor))}
     vendors_by_email: dict[str, Vendor] = {}
     for spec in VENDOR_SEED:
-        fields = {**spec, "is_active": True}
         vendor = existing_vendors.get(spec["paypal_merchant_email"])
         if vendor is None:
-            vendor = Vendor(**fields)
+            vendor = Vendor(**spec, is_active=True)
             session.add(vendor)
             vendors_created += 1
-        elif _apply(vendor, fields):
+        elif _apply(vendor, {k: v for k, v in spec.items() if k not in _INSERT_ONLY_VENDOR_FIELDS}):
             vendors_updated += 1
         vendors_by_email[spec["paypal_merchant_email"]] = vendor
     session.flush()
@@ -357,17 +365,38 @@ def seed_catalog(session: Session) -> SeedReport:
     existing_skus = {s.sku_code: s for s in session.scalars(select(ProductSKU))}
     for spec in SKU_SEED:
         fields = {k: v for k, v in spec.items() if k != "vendor"}
-        fields.update(
-            vendor_id=vendors_by_email[spec["vendor"]].id,
-            currency="USD",
-            is_active=True,
-        )
+        fields.update(vendor_id=vendors_by_email[spec["vendor"]].id, currency="USD")
         sku = existing_skus.get(spec["sku_code"])
         if sku is None:
-            session.add(ProductSKU(**fields))
+            session.add(ProductSKU(**fields, is_active=True))
             skus_created += 1
-        elif _apply(sku, fields):
+            continue
+        preserved = _INSERT_ONLY_SKU_FIELDS - ({"stock_quantity"} if reset_stock else set())
+        if _apply(sku, {k: v for k, v in fields.items() if k not in preserved}):
             skus_updated += 1
 
     session.commit()
     return SeedReport(vendors_created, vendors_updated, skus_created, skus_updated)
+
+
+def seed_catalog(
+    session: Session, *, reset_stock: bool = False, max_attempts: int = 3
+) -> SeedReport:
+    """Upsert the demo vendors and SKUs in one transaction. Safe to call any number of times.
+
+    Existing rows keep their live ``stock_quantity`` (unless ``reset_stock``) and ``is_active``.
+    If a concurrent process inserts the same keys first, the unique-constraint violation is
+    rolled back and the seed retries against the now-existing rows.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _seed_once(session, reset_stock=reset_stock)
+        except IntegrityError:
+            session.rollback()
+            if attempt == max_attempts:
+                raise
+            logger.warning("Seed raced with another writer (attempt %d); retrying", attempt)
+        except Exception:
+            session.rollback()
+            raise
+    raise AssertionError("unreachable")
