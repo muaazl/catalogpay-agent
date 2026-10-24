@@ -10,11 +10,13 @@ import pytest
 from fastapi.testclient import TestClient
 from google.genai import errors as genai_errors
 from google.genai import types
+from pydantic import ValidationError
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.api.v1.orders import FALLBACK_MODEL_NAME, get_order_parser
 from app.core.config import Settings, get_settings
 from app.core.limits import BodySizeLimitMiddleware
-from app.schemas.order_parser import GeminiExtractionPayload
+from app.schemas.order_parser import ExtractedLineItem, GeminiExtractionPayload
 from app.services import gemini_parser as gp
 from app.services.gemini_parser import (
     SYSTEM_INSTRUCTION,
@@ -760,3 +762,153 @@ def test_live_gemini_text_extraction():
     assert len(by_qty) == 2
     assert by_qty[0][0] == 2 and "tamper" in by_qty[0][1]
     assert by_qty[1][0] == 3 and "arabica" in by_qty[1][1]
+
+
+# =============================================================================================
+# Review remediation regressions (round 2)
+# =============================================================================================
+
+
+class TestReviewRegressionsRound2:
+    @pytest.mark.parametrize(
+        "line,query",
+        [
+            ("500 gm arabica", "500 gm arabica"),
+            ("500 gms arabica", "500 gms arabica"),
+            ("600 milliliter pitcher", "600 milliliter pitcher"),
+            ("600 millilitres pitcher", "600 millilitres pitcher"),
+            ("2 pounds decaf", "2 pounds decaf"),
+            ("1 kilogram arabica", "1 kilogram arabica"),
+            ("12 ounces cups", "12 ounces cups"),
+            ("58 millimeter tamper", "58 millimeter tamper"),
+            ("1 liter vanilla paste", "1 liter vanilla paste"),
+        ],
+    )
+    def test_spelled_out_units_are_sizes_not_quantities(self, line, query):
+        (got,) = parse_text_deterministic_fallback(line).items
+        assert (got.quantity, got.search_query) == (1, query)
+
+    def test_spelled_out_unit_reaches_matcher_as_a_size(self, client: TestClient):
+        line = client.post(TEXT_URL, json={"text": "600 milliliter pitcher"}).json()[
+            "match_preview"
+        ]["lines"][0]
+        assert line["quantity"] == 1
+        assert line["normalized_query"] == "600ml pitcher"
+        assert line["matched_sku"]["sku_code"] == "BPE-PIT-600ML"
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("2x arabica and three tampers", [(2, "arabica"), (3, "tampers")]),
+            ("1 grinder plus two knock boxes", [(1, "grinder"), (2, "knock boxes")]),
+            ("oat milk and a dozen croissants", [(1, "oat milk"), (12, "croissants")]),
+            ("yeast & half a dozen croissants", [(1, "yeast"), (6, "croissants")]),
+            ("3 lids + an box of straws", [(3, "lids"), (1, "straws")]),
+            ("salt and pepper grinder", [(1, "salt and pepper grinder")]),  # no qty -> no split
+        ],
+    )
+    def test_conjunctions_split_before_number_words(self, text, expected):
+        result = parse_text_deterministic_fallback(text)
+        assert [(i.quantity, i.search_query) for i in result.items] == expected
+
+    @pytest.mark.parametrize(
+        "fragments,expected",
+        [
+            (123, []),
+            (True, []),
+            ({"a": 1}, []),
+            (None, []),
+            ("stray note", ["stray note"]),
+            ("   ", []),
+            (["  ok  ", 5, True, None, {"x": 1}, ""], ["ok", "5"]),
+        ],
+    )
+    def test_coerce_payload_unrecognized_fragments_shapes(self, fragments, expected):
+        result = coerce_payload({"items": [], "unrecognized_fragments": fragments})
+        assert result.unrecognized_fragments == expected
+
+    @pytest.mark.parametrize("bad", [True, False, 2.5, "3", None, [2], {"n": 2}])
+    def test_coerce_payload_rejects_non_integer_quantities(self, bad):
+        result = coerce_payload(
+            {"items": [{"raw_line_text": "bad line", "search_query": "yeast", "quantity": bad}]}
+        )
+        assert result.items == [] and result.unrecognized_fragments == ["bad line"]
+
+    def test_coerce_payload_accepts_integral_float_and_strips_strings(self):
+        result = coerce_payload(
+            {
+                "items": [
+                    {
+                        "raw_line_text": "  2 yeast ",
+                        "search_query": "  instant yeast  ",
+                        "quantity": 2.0,
+                        "unit_hint": "   ",
+                        "notes": " fresh ",
+                    }
+                ]
+            }
+        )
+        (got,) = result.items
+        assert (got.raw_line_text, got.search_query, got.quantity) == (
+            "2 yeast",
+            "instant yeast",
+            2,
+        )
+        assert got.unit_hint is None and got.notes == "fresh"
+
+    def test_extracted_line_item_is_strict(self):
+        with pytest.raises(ValidationError):
+            ExtractedLineItem(raw_line_text="x", search_query="y", quantity=True)
+        with pytest.raises(ValidationError):
+            ExtractedLineItem(raw_line_text="x", search_query="   ", quantity=1)
+
+    @pytest.mark.parametrize(
+        "items",
+        [
+            [{"raw_line_text": "a", "search_query": "yeast", "quantity": True}],
+            [{"raw_line_text": "a", "search_query": "yeast", "quantity": 2.5}],
+            [{"raw_line_text": 7, "search_query": 8, "quantity": 1}],
+        ],
+    )
+    def test_malformed_gemini_quantities_never_500(self, client, use_parser, items):
+        use_parser(make_parser(gemini_response({"items": items, "unrecognized_fragments": 123}))[0])
+        resp = client.post(TEXT_URL, json={"text": "whatever"})
+        assert resp.status_code == 200
+        assert resp.json()["extracted_items"] == []
+
+    def test_parse_media_closes_upload_and_validates_before_parser(
+        self, client, use_parser, monkeypatch
+    ):
+        # Starlette also closes uploads after the response, so record ordering: our handler
+        # must close the file *before* the parser runs / before an error response is built.
+        events: list[tuple[str, str]] = []
+        real_close = StarletteUploadFile.close
+
+        async def tracking_close(self):
+            events.append(("close", self.filename))
+            await real_close(self)
+
+        monkeypatch.setattr(StarletteUploadFile, "close", tracking_close)
+        parser, _ = make_parser(gemini_response({"items": []}))
+
+        async def unguarded_parse_media(data, mime_type, note=None):  # skips its own checks
+            events.append(("parse", mime_type))
+            return GeminiExtractionPayload(items=[])
+
+        parser.parse_media = unguarded_parse_media  # type: ignore[method-assign]
+        use_parser(parser)
+
+        ok = client.post(MEDIA_URL, files={"file": ("ok.png", PNG, "image/png")})
+        assert ok.status_code == 200
+        assert events.index(("close", "ok.png")) < events.index(("parse", "image/png"))
+
+        events.clear()
+        spoofed = client.post(MEDIA_URL, files={"file": ("x.png", b"<html>", "image/png")})
+        assert spoofed.status_code == 415
+        assert ("parse", "image/png") not in events  # magic bytes checked in the endpoint
+        assert ("close", "x.png") in events
+
+        events.clear()
+        bad_type = client.post(MEDIA_URL, files={"file": ("e.html", b"<html>", "text/html")})
+        assert bad_type.status_code == 415
+        assert ("close", "e.html") in events
