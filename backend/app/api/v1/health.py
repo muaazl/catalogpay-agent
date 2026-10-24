@@ -3,7 +3,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import AppSettings, DbSession
-from app.models.catalog import ProductSKU
+from app.models.catalog import ProductSKU, Vendor
 from app.schemas.catalog import DatabaseHealth, HealthResponse
 
 router = APIRouter(tags=["health"])
@@ -15,7 +15,10 @@ def health(db: DbSession, settings: AppSettings, response: Response) -> HealthRe
     try:
         db.execute(text("SELECT 1"))
         active = db.scalar(
-            select(func.count()).select_from(ProductSKU).where(ProductSKU.is_active.is_(True))
+            select(func.count())
+            .select_from(ProductSKU)
+            .join(ProductSKU.vendor)
+            .where(ProductSKU.is_active.is_(True), Vendor.is_active.is_(True))
         )
         database = DatabaseHealth(connected=True, dialect=dialect)
         overall, active_count = "ok", int(active or 0)
