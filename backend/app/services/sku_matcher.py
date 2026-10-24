@@ -42,13 +42,14 @@ _UNIT_TABLE: dict[str, tuple[str, Fraction]] = {
     **dict.fromkeys(("mm", "millimeter", "millimeters", "millimetre"), _MM),
     **dict.fromkeys(("cm", "centimeter", "centimeters", "centimetre"), _CM),
 }
-_UNIT_ALTERNATION = "|".join(sorted(_UNIT_TABLE, key=len, reverse=True))
+# Shared with the order-text fallback parser so both agree on what counts as a size unit.
+UNIT_ALTERNATION = "|".join(sorted(_UNIT_TABLE, key=len, reverse=True))
 # Hard cap on query length: callers may pass anything, the matcher only ever reads this much.
 MAX_QUERY_CHARS = 500
 # Digit runs are bounded and must not touch other digits/letters on either side, so a
 # pathological "999...9lb" never parses as a measure (or reaches big-number arithmetic).
 _QUANTITY_RE = re.compile(
-    rf"(?<![a-z0-9.])(\d{{1,7}}(?:\.\d{{1,3}})?)\s*({_UNIT_ALTERNATION})(?![a-z0-9])"
+    rf"(?<![a-z0-9.])(\d{{1,7}}(?:\.\d{{1,3}})?)\s*({UNIT_ALTERNATION})(?![a-z0-9])"
 )
 _MEASURE_TOKEN_RE = re.compile(r"^\d{1,10}(?:\.\d)?(?:g|ml|oz|mm)$")
 _THOUSANDS_RE = re.compile(r"(?<![\d,.])\d{1,3}(?:,\d{3})+(?![\d,])")
@@ -124,7 +125,8 @@ def extract_measures(normalized: str) -> frozenset[str]:
 
 
 def _measure_dimension(token: str) -> str:
-    return re.sub(r"^\d+", "", token)
+    """'453.6g' -> 'g', '58mm' -> 'mm'."""
+    return re.sub(r"^\d+(?:\.\d+)?", "", token)
 
 
 # --------------------------------------------------------------------------------------------
