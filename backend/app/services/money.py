@@ -13,7 +13,7 @@ class FeeSplit:
     net_vendor_payout_cents: int
 
 
-def _require_int(name: str, value: object) -> int:
+def require_int(name: str, value: object) -> int:
     # ``type(...) is int`` on purpose: bool subclasses int, and floats/Decimals/strings must
     # never silently become money.
     if type(value) is not int:
@@ -22,8 +22,8 @@ def _require_int(name: str, value: object) -> int:
 
 
 def line_subtotal_cents(unit_price_cents: int, quantity: int) -> int:
-    _require_int("unit_price_cents", unit_price_cents)
-    _require_int("quantity", quantity)
+    require_int("unit_price_cents", unit_price_cents)
+    require_int("quantity", quantity)
     if unit_price_cents < 0 or quantity < 0:
         raise ValueError("unit_price_cents and quantity must be non-negative")
     return unit_price_cents * quantity
@@ -31,8 +31,8 @@ def line_subtotal_cents(unit_price_cents: int, quantity: int) -> int:
 
 def platform_fee_cents(subtotal_cents: int, commission_rate_bps: int) -> int:
     """Commission on ``subtotal_cents`` at ``commission_rate_bps``, rounded half-up to a cent."""
-    _require_int("subtotal_cents", subtotal_cents)
-    _require_int("commission_rate_bps", commission_rate_bps)
+    require_int("subtotal_cents", subtotal_cents)
+    require_int("commission_rate_bps", commission_rate_bps)
     if subtotal_cents < 0:
         raise ValueError("subtotal_cents must be non-negative")
     if not 0 <= commission_rate_bps <= BPS_DENOMINATOR:
@@ -48,7 +48,7 @@ def allocate_fee(subtotals_cents: Sequence[int], commission_rate_bps: int) -> li
     changes the total fee.
     """
     for i, subtotal in enumerate(subtotals_cents):
-        _require_int(f"subtotals_cents[{i}]", subtotal)
+        require_int(f"subtotals_cents[{i}]", subtotal)
         if subtotal < 0:
             raise ValueError("subtotals must be non-negative")
     total_fee = platform_fee_cents(sum(subtotals_cents), commission_rate_bps)
