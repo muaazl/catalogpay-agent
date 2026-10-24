@@ -6,7 +6,6 @@ from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
-    DateTime,
     ForeignKey,
     Integer,
     String,
@@ -15,6 +14,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+from app.db.types import UTCDateTime
 
 
 def _utcnow() -> datetime:
@@ -35,9 +35,7 @@ class Vendor(Base):
     paypal_merchant_email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
     commission_rate_bps: Mapped[int] = mapped_column(Integer, nullable=False, default=500)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
-    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=_utcnow)
 
     skus: Mapped[list["ProductSKU"]] = relationship(back_populates="vendor")
 
