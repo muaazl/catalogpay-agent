@@ -43,8 +43,16 @@ _UNIT_TABLE: dict[str, tuple[str, Fraction]] = {
     **dict.fromkeys(("cm", "centimeter", "centimeters", "centimetre"), _CM),
 }
 _UNIT_ALTERNATION = "|".join(sorted(_UNIT_TABLE, key=len, reverse=True))
-_QUANTITY_RE = re.compile(rf"(?<![a-z])(\d+(?:\.\d+)?)\s*({_UNIT_ALTERNATION})(?![a-z])")
-_MEASURE_TOKEN_RE = re.compile(r"^\d+(?:g|ml|oz|mm)$")
+# Hard cap on query length: callers may pass anything, the matcher only ever reads this much.
+MAX_QUERY_CHARS = 500
+# Digit runs are bounded and must not touch other digits/letters on either side, so a
+# pathological "999...9lb" never parses as a measure (or reaches big-number arithmetic).
+_QUANTITY_RE = re.compile(
+    rf"(?<![a-z0-9.])(\d{{1,7}}(?:\.\d{{1,3}})?)\s*({_UNIT_ALTERNATION})(?![a-z0-9])"
+)
+_MEASURE_TOKEN_RE = re.compile(r"^\d{1,10}(?:\.\d)?(?:g|ml|oz|mm)$")
+_THOUSANDS_RE = re.compile(r"(?<![\d,.])\d{1,3}(?:,\d{3})+(?![\d,])")
+_DECIMAL_COMMA_RE = re.compile(r"(\d),(\d{1,2})(?!\d)")
 
 _WORD_FRACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bhalf\s+(?:a\s+)?dozen\b"), "6"),
@@ -79,10 +87,12 @@ _STOPWORDS = frozenset(
 
 
 def _format_amount(amount: Fraction) -> str:
+    """Render a non-negative amount with at most one decimal, using exact integer arithmetic."""
     rounded = round(amount)
     if abs(amount - rounded) < Fraction(1, 100):
         return str(rounded)
-    return f"{float(amount):.1f}".rstrip("0").rstrip(".")
+    whole, tenth = divmod(round(amount * 10), 10)
+    return f"{whole}.{tenth}" if tenth else str(whole)
 
 
 def _canonicalize_quantity(match: re.Match[str]) -> str:
@@ -97,10 +107,12 @@ def normalize_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).replace("\u2044", "/")
     text = unicodedata.normalize("NFKD", text)
     text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
-    text = re.sub(r"(\d),(\d)", r"\1.\2", text)  # European decimals: 0,5kg
+    # Thousands separators before decimal commas: "1,000g" -> "1000g", then "0,5kg" -> "0.5kg".
+    text = _THOUSANDS_RE.sub(lambda m: m.group(0).replace(",", ""), text)
+    text = _DECIMAL_COMMA_RE.sub(r"\1.\2", text)
     for pattern, replacement in _WORD_FRACTIONS:
         text = pattern.sub(replacement, text)
-    text = re.sub(r"[^a-z0-9./%]+", " ", text)
+    text = re.sub(r"[^a-z0-9./]+", " ", text)
     text = _QUANTITY_RE.sub(_canonicalize_quantity, text)
     text = re.sub(r"(?<!\d)\.|\.(?!\d)|/", " ", text)
     tokens = [t for t in text.split() if t not in _STOPWORDS]
@@ -353,6 +365,7 @@ class HybridSKUMatcher:
     def match(self, query: str, top_k: int = 3) -> MatchResult:
         if top_k < 1:
             raise ValueError("top_k must be >= 1")
+        query = query[:MAX_QUERY_CHARS]
         normalized = normalize_text(query)
         if not normalized or not self.entries:
             return MatchResult(query, normalized, MatchStatus.UNMATCHED)
