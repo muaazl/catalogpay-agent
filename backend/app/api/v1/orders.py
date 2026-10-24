@@ -1,12 +1,33 @@
 from functools import lru_cache
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    Path,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from google import genai
 from google.genai import types
+from sqlalchemy import func, select
 
-from app.api.deps import AppSettings, Matcher
+from app.api.deps import AppSettings, DbSession, Matcher, PayPal
+from app.models.order import Order, OrderStatus
 from app.schemas.catalog import MatchPreviewItem
+from app.schemas.order import (
+    IDEMPOTENCY_KEY_PATTERN,
+    PUBLIC_ORDER_ID_PATTERN,
+    CreateOrderRequest,
+    OrderListResponse,
+    OrderOut,
+    OrderSummaryOut,
+)
 from app.schemas.order_parser import (
     GeminiExtractionPayload,
     ParsedOrderPreviewResponse,
@@ -22,8 +43,16 @@ from app.services.gemini_parser import (
     ParserNotConfiguredError,
     UnsupportedMediaTypeError,
     normalize_media_type,
+    validate_media,
 )
 from app.services.order_preview import build_match_preview
+from app.services.order_settlement import (
+    InvalidOrderError,
+    capture_order_and_disburse,
+    create_order_from_items,
+    load_order,
+    retry_payouts,
+)
 from app.services.order_text_fallback import parse_text_deterministic_fallback
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -109,24 +138,29 @@ async def parse_media(
     note: Annotated[str, Form(max_length=1000)] = "",
     top_k: Annotated[int, Form(ge=1, le=10)] = 3,
 ) -> ParsedOrderPreviewResponse:
-    mime_type = normalize_media_type(file.content_type)
-    if mime_type not in ALLOWED_MEDIA_TYPES:
-        raise UnsupportedMediaTypeError(
-            f"Unsupported media type '{mime_type or 'unknown'}'. "
-            f"Allowed: {', '.join(sorted(ALLOWED_MEDIA_TYPES))}."
-        )
-    if not parser.is_configured:
-        raise ParserNotConfiguredError(
-            "GEMINI_API_KEY is required for image, PDF and audio order parsing."
-        )
-    # Read at most one byte past the limit: enough to detect "too large" without buffering more.
-    data = await file.read(settings.max_upload_bytes + 1)
+    try:
+        mime_type = normalize_media_type(file.content_type)
+        if mime_type not in ALLOWED_MEDIA_TYPES:
+            raise UnsupportedMediaTypeError(
+                f"Unsupported media type '{mime_type or 'unknown'}'. "
+                f"Allowed: {', '.join(sorted(ALLOWED_MEDIA_TYPES))}."
+            )
+        if not parser.is_configured:
+            raise ParserNotConfiguredError(
+                "GEMINI_API_KEY is required for image, PDF and audio order parsing."
+            )
+        # Read at most one byte past the limit: enough to detect "too large" without buffering.
+        data = await file.read(settings.max_upload_bytes + 1)
+    finally:
+        await file.close()
     if len(data) > settings.max_upload_bytes:
         raise MediaTooLargeError(
             f"Uploaded file exceeds the {settings.max_upload_bytes} byte limit."
         )
     if not data:
         raise EmptyMediaError("Uploaded file is empty.")
+    # Size + magic-byte check against the declared type before any bytes reach Gemini.
+    mime_type = validate_media(data, mime_type, settings.max_upload_bytes)
 
     extraction = await parser.parse_media(data, mime_type, note)
     return _build_response(
@@ -137,3 +171,84 @@ async def parse_media(
         currency=settings.default_currency,
         top_k=top_k,
     )
+
+
+# --------------------------------------------------------------------------------------------
+# Order ledger & settlement
+# --------------------------------------------------------------------------------------------
+
+OrderIdPath = Annotated[str, Path(pattern=PUBLIC_ORDER_ID_PATTERN)]
+
+
+@router.post(
+    "",
+    response_model=OrderOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={200: {"description": "Idempotent replay of an existing order"}},
+)
+async def create_order(
+    payload: CreateOrderRequest,
+    response: Response,
+    db: DbSession,
+    paypal: PayPal,
+    settings: AppSettings,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", pattern=IDEMPOTENCY_KEY_PATTERN)
+    ] = None,
+) -> OrderOut:
+    if idempotency_key and payload.idempotency_key and idempotency_key != payload.idempotency_key:
+        raise InvalidOrderError("Idempotency-Key header and body idempotency_key differ.")
+    key = idempotency_key or payload.idempotency_key
+    if not key:
+        raise InvalidOrderError("An Idempotency-Key header (or body idempotency_key) is required.")
+    order, created = await create_order_from_items(
+        db,
+        paypal,
+        items=payload.items,
+        idempotency_key=key,
+        customer_note=payload.customer_note,
+        parser_mode=payload.parser_mode,
+        currency=settings.default_currency,
+    )
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return OrderOut.model_validate(order)
+
+
+@router.get("", response_model=OrderListResponse)
+def list_orders(
+    db: DbSession,
+    status_filter: Annotated[OrderStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> OrderListResponse:
+    stmt = select(Order)
+    if status_filter is not None:
+        stmt = stmt.where(Order.status == status_filter)
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = db.scalars(
+        stmt.order_by(Order.created_at.desc(), Order.id.desc()).limit(limit).offset(offset)
+    ).all()
+    return OrderListResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=[OrderSummaryOut.model_validate(r) for r in rows],
+    )
+
+
+@router.get("/{public_order_id}", response_model=OrderOut)
+def get_order(public_order_id: OrderIdPath, db: DbSession) -> OrderOut:
+    return OrderOut.model_validate(load_order(db, public_order_id))
+
+
+@router.post("/{public_order_id}/capture", response_model=OrderOut)
+async def capture_order(public_order_id: OrderIdPath, db: DbSession, paypal: PayPal) -> OrderOut:
+    return OrderOut.model_validate(await capture_order_and_disburse(db, paypal, public_order_id))
+
+
+@router.post("/{public_order_id}/retry-payouts", response_model=OrderOut)
+async def retry_order_payouts(
+    public_order_id: OrderIdPath, db: DbSession, paypal: PayPal
+) -> OrderOut:
+    return OrderOut.model_validate(await retry_payouts(db, paypal, public_order_id))
