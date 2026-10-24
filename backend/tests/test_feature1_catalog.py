@@ -21,6 +21,7 @@ from app.services.sku_matcher import (
     CharNgramTfidf,
     HybridSKUMatcher,
     MatchStatus,
+    _measure_dimension,
     extract_measures,
     normalize_text,
 )
@@ -815,3 +816,22 @@ class TestReviewRegressions:
     )
     def test_strict_request_schema(self, client: TestClient, payload):
         assert client.post("/api/v1/catalog/match-preview", json=payload).status_code == 422
+
+
+class TestReviewRegressionsRound2:
+    @pytest.mark.parametrize(
+        "token,dimension",
+        [("453.6g", "g"), ("500g", "g"), ("1500ml", "ml"), ("58mm", "mm"), ("12oz", "oz")],
+    )
+    def test_measure_dimension_handles_decimals(self, token, dimension):
+        assert _measure_dimension(token) == dimension
+
+    def test_decimal_pound_weight_conflicts_with_100g_sku(self, matcher: HybridSKUMatcher):
+        assert extract_measures(normalize_text("matcha 1 lb")) == {"453.6g"}
+        result = matcher.match("ceremonial matcha powder 1 lb", top_k=5)
+        matcha = next(c for c in result.candidates if c.entry.sku_code == "SPR-TEA-MAT-100G")
+        assert matcha.unit_score == 0.0  # 453.6g vs 100g: same dimension, explicit conflict
+        assert "conflicts with" in matcha.match_reasoning
+        exact = matcher.match("ceremonial matcha powder 100g").best
+        assert exact.entry.sku_code == "SPR-TEA-MAT-100G"
+        assert matcha.confidence_score < exact.confidence_score - 0.1
