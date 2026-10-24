@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     low_confidence_threshold: float = Field(default=0.40, ge=0.0, le=1.0)
     match_top_k_default: int = Field(default=3, ge=1, le=25)
 
+    # Gemini order parser. An empty key disables Gemini (text falls back to the regex parser).
+    gemini_api_key: str = Field(default="", repr=False)
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    max_upload_bytes: int = Field(default=10 * 1024 * 1024, ge=1, le=50 * 1024 * 1024)
+
     @model_validator(mode="after")
     def _check_thresholds(self) -> "Settings":
         if self.low_confidence_threshold > self.match_confidence_threshold:
