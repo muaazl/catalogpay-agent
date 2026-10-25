@@ -912,3 +912,17 @@ class TestReviewRegressionsRound2:
         bad_type = client.post(MEDIA_URL, files={"file": ("e.html", b"<html>", "text/html")})
         assert bad_type.status_code == 415
         assert ("close", "e.html") in events
+
+
+class TestNoteLinesAreNotSplit:
+    def test_comma_inside_note_line_does_not_create_an_item(self):
+        result = parse_text_deterministic_fallback(
+            "- 2 yeast\nNote: deliver Thursday before 7am, back door. Thanks!"
+        )
+        assert [i.search_query for i in result.items] == ["yeast"]
+        assert result.customer_note == "deliver Thursday before 7am, back door. Thanks!"
+
+    def test_inline_note_after_comma_is_still_a_note(self):
+        result = parse_text_deterministic_fallback("2 yeast, note: urgent please")
+        assert [i.search_query for i in result.items] == ["yeast"]
+        assert result.customer_note == "urgent please"
