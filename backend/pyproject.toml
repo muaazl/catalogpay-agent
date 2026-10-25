@@ -1,6 +1,6 @@
 [project]
 name = "catalogpay-agent-backend"
-version = "0.1.0"
+version = "1.0.0"
 description = "CatalogPay Agent: messy buyer orders -> SKU-verified PayPal Orders with multi-vendor split payouts."
 license = "MIT"
 requires-python = ">=3.12"
@@ -23,6 +23,10 @@ dev = [
     "pytest-asyncio==1.4.0",
     "ruff==0.17.2",
 ]
+# Only for regenerating samples/ (scripts/generate_samples.py); never needed at runtime.
+samples = [
+    "pillow==13.0.0",
+]
 
 [build-system]
 requires = ["setuptools>=75"]
@@ -35,6 +39,12 @@ include = ["app*"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
+# Two known third-party deprecations we cannot fix in our code. Matched on exact message
+# text so any *new* warning (including from our code) still surfaces.
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    "ignore:'_UnionGenericAlias' is deprecated and slated for removal:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100
