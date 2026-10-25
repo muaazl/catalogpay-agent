@@ -4,6 +4,9 @@ import os
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["SEED_ON_STARTUP"] = "false"
 os.environ["ENVIRONMENT"] = "test"
+# Tests never auto-serve a locally built frontend/dist; Feature 5 tests opt in explicitly.
+os.environ["STATIC_DIST_DIR"] = os.path.join(os.path.dirname(__file__), "__no_dist__")
+os.environ["SEED_DEMO_ORDERS"] = "false"
 # Never let a developer's real key make tests hit the network; the opt-in live test reads it here.
 os.environ["CATALOGPAY_LIVE_GEMINI_KEY"] = os.environ.get("GEMINI_API_KEY", "")
 os.environ["GEMINI_API_KEY"] = ""
