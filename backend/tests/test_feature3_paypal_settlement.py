@@ -26,7 +26,13 @@ from app.models.order import (
     PayPalWebhookEvent,
     VendorPayout,
 )
-from app.services.order_settlement import reserve_stock
+from app.services import order_settlement as settlement
+from app.services.order_settlement import (
+    PayPalCaptureVerificationError,
+    payout_ids,
+    reserve_stock,
+    verify_capture,
+)
 from app.services.paypal_client import (
     TOKEN_REFRESH_MARGIN_SECONDS,
     PayoutItem,
@@ -39,6 +45,7 @@ from app.services.paypal_client import (
     format_cents_for_paypal,
     get_gemini_paypal_tools,
     get_mcp_tool_definitions,
+    is_trusted_paypal_cert_url,
     parse_paypal_amount,
 )
 from app.services.paypal_simulator import simulate_webhook_headers
@@ -762,15 +769,16 @@ class TestCaptureFailures:
         assert done["status"] == "COMPLETED"
         assert done["paypal_capture_id"] == "SIM-CAPTURE-EXTERNAL"
 
-    def test_capture_amount_mismatch_holds_payouts(self, client, paypal, seeded_session):
+    def test_capture_amount_mismatch_blocks_capture_and_payouts(self, client, paypal):
         order = create(client).json()
         paypal.simulator.orders[order["paypal_order_id"]].amount_cents -= 1
-        held = client.post(f"{ORDERS}/{order['public_order_id']}/capture").json()
-        assert held["status"] == "CAPTURED"
+        resp = client.post(f"{ORDERS}/{order['public_order_id']}/capture")
+        assert resp.status_code == 502 and resp.json()["error"] == "capture_verification_failed"
+        held = client.get(f"{ORDERS}/{order['public_order_id']}").json()
+        assert held["status"] == "PAYPAL_ORDER_CREATED"  # never advanced to CAPTURED
         assert "ledger total is 27778" in held["payout_hold_reason"]
         assert paypal.simulator.disbursements == []
-        retry = client.post(f"{ORDERS}/{order['public_order_id']}/retry-payouts").json()
-        assert retry["status"] == "CAPTURED" and paypal.simulator.disbursements == []
+        assert client.post(f"{ORDERS}/{order['public_order_id']}/retry-payouts").status_code == 409
 
     def test_capture_requires_paypal_order(self, client, paypal):
         paypal.simulator.inject("create_order", status=503)
@@ -1198,3 +1206,456 @@ class TestBugsFoundDuringFeature3:
         }
         assert len(ids) == 1 and replay["status"] == "PAYPAL_ORDER_CREATED"
         assert len(paypal.simulator.orders) == 1  # PayPal holds one order, not two
+
+
+# =============================================================================================
+# Fintech audit remediation (round 4)
+# =============================================================================================
+
+
+def _capture_body(paypal_order_id: str, capture: dict) -> dict:
+    return {
+        "id": paypal_order_id,
+        "status": "COMPLETED",
+        "purchase_units": [{"payments": {"captures": [capture]}}],
+    }
+
+
+BAD_CAPTURES = {
+    "missing_amount": {"id": "CAP-BAD", "status": "COMPLETED"},
+    "wrong_value": {
+        "id": "CAP-BAD",
+        "status": "COMPLETED",
+        "amount": {"currency_code": "USD", "value": "277.77"},
+    },
+    "wrong_currency": {
+        "id": "CAP-BAD",
+        "status": "COMPLETED",
+        "amount": {"currency_code": "EUR", "value": "277.78"},
+    },
+    "missing_currency": {"id": "CAP-BAD", "status": "COMPLETED", "amount": {"value": "277.78"}},
+    "garbage_value": {
+        "id": "CAP-BAD",
+        "status": "COMPLETED",
+        "amount": {"currency_code": "USD", "value": "277.78.1"},
+    },
+}
+
+
+def _order_row(session: Session, public_order_id: str) -> Order:
+    session.expire_all()
+    return session.scalar(select(Order).where(Order.public_order_id == public_order_id))
+
+
+class TestF301StrictCaptureVerification:
+    @pytest.mark.parametrize("case", sorted(BAD_CAPTURES))
+    def test_api_capture_with_unverifiable_amount_blocks_everything(
+        self, client, paypal, seeded_session, case
+    ):
+        order = create(client).json()
+        before = stock(seeded_session, "BPE-TMP-58MM")
+        paypal.simulator.inject(
+            "capture", status=201, body=_capture_body(order["paypal_order_id"], BAD_CAPTURES[case])
+        )
+        resp = client.post(f"{ORDERS}/{order['public_order_id']}/capture")
+        assert resp.status_code == 502, resp.text
+        assert resp.json()["error"] == "capture_verification_failed"
+
+        state = client.get(f"{ORDERS}/{order['public_order_id']}").json()
+        assert state["status"] == "PAYPAL_ORDER_CREATED"
+        assert state["captured_at"] is None
+        assert state["payout_hold_reason"]
+        assert state["paypal_capture_id"] == "CAP-BAD"  # recorded for operators
+        assert all(p["status"] == "PENDING" for p in state["payouts"])
+        assert paypal.simulator.disbursements == []
+        assert paypal.simulator.calls["payout"] == 0
+        # Funds may have moved, so the reservation is kept (no overselling), not released.
+        assert state["stock_reserved"] is True
+        assert stock(seeded_session, "BPE-TMP-58MM") == before - 2
+
+    @pytest.mark.parametrize(
+        "amount_cents,currency,ok",
+        [
+            (27778, "USD", True),
+            (27778, "usd", True),
+            (None, "USD", False),
+            (27777, "USD", False),
+            (27779, "USD", False),
+            (27778, "EUR", False),
+            (27778, None, False),
+            (27778, "", False),
+        ],
+    )
+    def test_verify_capture_unit(self, client, paypal, seeded_session, amount_cents, currency, ok):
+        order = _order_row(seeded_session, create(client).json()["public_order_id"])
+        if ok:
+            verify_capture(order, amount_cents=amount_cents, currency=currency)
+        else:
+            with pytest.raises(PayPalCaptureVerificationError):
+                verify_capture(order, amount_cents=amount_cents, currency=currency)
+
+    @pytest.mark.parametrize(
+        "amount",
+        [
+            None,
+            {"currency_code": "USD", "value": "1.00"},
+            {"currency_code": "EUR", "value": "277.78"},
+        ],
+    )
+    def test_capture_completed_webhook_with_bad_amount_is_rejected(
+        self, client, paypal, seeded_session, amount
+    ):
+        order = create(client).json()
+        before = stock(seeded_session, "BPE-TMP-58MM")
+        event = capture_event(order["paypal_order_id"], "CAP-EXT", "277.78")
+        if amount is None:
+            del event["resource"]["amount"]
+        else:
+            event["resource"]["amount"] = amount
+        ack = post_webhook(client, paypal, event)
+        assert ack.status_code == 200 and ack.json()["status"] == "rejected"
+        state = client.get(f"{ORDERS}/{order['public_order_id']}").json()
+        assert state["status"] == "PAYPAL_ORDER_CREATED" and state["payout_hold_reason"]
+        assert stock(seeded_session, "BPE-TMP-58MM") == before  # nothing adopted
+        assert paypal.simulator.disbursements == []
+
+    def _pending_capture(self, client, paypal) -> dict:
+        order = create(client).json()
+        paypal.simulator.inject(
+            "capture",
+            status=201,
+            body=_capture_body(
+                order["paypal_order_id"],
+                {
+                    "id": "CAP-PENDING",
+                    "status": "PENDING",
+                    "amount": {"currency_code": "USD", "value": "277.78"},
+                },
+            ),
+        )
+        state = client.post(f"{ORDERS}/{order['public_order_id']}/capture").json()
+        assert state["status"] == "CAPTURED" and state["paypal_capture_status"] == "PENDING"
+        assert paypal.simulator.disbursements == []  # pending funds are never disbursed
+        return state
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda r: r.pop("amount"),
+            lambda r: r.update(amount={"currency_code": "USD", "value": "277.77"}),
+            lambda r: r.update(amount={"currency_code": "EUR", "value": "277.78"}),
+            lambda r: r.update(id="CAP-SOMEONE-ELSE"),
+        ],
+        ids=["no-amount", "wrong-value", "wrong-currency", "wrong-capture-id"],
+    )
+    def test_pending_to_completed_webhook_is_reverified(self, client, paypal, mutate):
+        state = self._pending_capture(client, paypal)
+        event = capture_event(state["paypal_order_id"], "CAP-PENDING", "277.78")
+        mutate(event["resource"])
+        ack = post_webhook(client, paypal, event).json()
+        assert ack["status"] == "rejected"
+        after = client.get(f"{ORDERS}/{state['public_order_id']}").json()
+        assert after["status"] == "CAPTURED" and after["payout_hold_reason"]
+        assert paypal.simulator.disbursements == []
+
+    def test_pending_to_completed_webhook_valid_disburses(self, client, paypal):
+        state = self._pending_capture(client, paypal)
+        event = capture_event(state["paypal_order_id"], "CAP-PENDING", "277.78")
+        assert post_webhook(client, paypal, event).json()["status"] == "processed"
+        done = client.get(f"{ORDERS}/{state['public_order_id']}").json()
+        assert done["status"] == "COMPLETED" and len(paypal.simulator.disbursements) == 3
+
+    def test_disbursement_requires_completed_capture_status(self, client, paypal, seeded_session):
+        order_id = create(client).json()["public_order_id"]
+        row = _order_row(seeded_session, order_id)
+        row.status, row.paypal_capture_status = OrderStatus.CAPTURED, None
+        seeded_session.commit()
+        resp = client.post(f"{ORDERS}/{order_id}/retry-payouts").json()
+        assert resp["status"] == "CAPTURED" and paypal.simulator.disbursements == []
+
+
+class TestF302PayoutIdRotationAndDuplicates:
+    def test_payout_ids_helper(self):
+        assert payout_ids("ORD-ABC", 3, 0) == ("ORD-ABC-V3", "ORD-ABC-V3-ITEM")
+        assert payout_ids("ORD-ABC", 3, 2) == ("ORD-ABC-V3-R2", "ORD-ABC-V3-R2-ITEM")
+
+    def test_rotation_changes_both_ids_and_stale_webhooks_cannot_touch_new_attempt(
+        self, client, paypal
+    ):
+        sim = paypal.simulator
+        sim.instant_payouts = False
+        order_id = create(client).json()["public_order_id"]
+        first = client.post(f"{ORDERS}/{order_id}/capture").json()["payouts"][0]
+        old_batch, old_sender_batch, old_item = (
+            first["paypal_payout_batch_id"],
+            first["sender_batch_id"],
+            first["sender_item_id"],
+        )
+
+        post_webhook(client, paypal, batch_event(old_batch, "DENIED", event_id="WH-DENY-1"))
+        denied = next(
+            p
+            for p in client.get(f"{ORDERS}/{order_id}").json()["payouts"]
+            if p["id"] == first["id"]
+        )
+        assert denied["status"] == "FAILED"
+        assert denied["sender_batch_id"] == f"{old_sender_batch}-R1"
+        assert denied["sender_item_id"] == f"{old_sender_batch}-R1-ITEM"
+        assert denied["sender_item_id"] != old_item
+
+        retried = client.post(f"{ORDERS}/{order_id}/retry-payouts").json()
+        active = next(p for p in retried["payouts"] if p["id"] == first["id"])
+        assert active["status"] == "PROCESSING"
+        assert active["paypal_payout_batch_id"] not in (None, old_batch)
+        sent = (
+            json.loads(sim.requests[-1].content)
+            if sim.requests[-1].url.path.endswith("/payouts")
+            else None
+        )
+        payout_bodies = [
+            json.loads(r.content) for r in sim.requests if r.url.path == "/v1/payments/payouts"
+        ]
+        assert payout_bodies[-1]["items"][0]["sender_item_id"] == active["sender_item_id"]
+        assert sent is None or sent == payout_bodies[-1]
+
+        # Late deliveries about attempt #1 must not overwrite attempt #2.
+        stale_item = {
+            "id": "WH-STALE-ITEM",
+            "event_type": "PAYMENT.PAYOUTSITEM.FAILED",
+            "resource": {"payout_item": {"sender_item_id": old_item}},
+        }
+        assert post_webhook(client, paypal, stale_item).json()["status"] == "ignored"
+        stale_batch = batch_event(old_batch, "DENIED", event_id="WH-STALE-BATCH")
+        stale_batch["resource"]["batch_header"]["sender_batch_header"] = {
+            "sender_batch_id": old_sender_batch
+        }
+        assert post_webhook(client, paypal, stale_batch).json()["status"] == "ignored"
+        still = next(
+            p
+            for p in client.get(f"{ORDERS}/{order_id}").json()["payouts"]
+            if p["id"] == first["id"]
+        )
+        assert still == active
+
+        ok = post_webhook(client, paypal, batch_event(active["paypal_payout_batch_id"]))
+        assert ok.json()["status"] == "processed"
+
+    def test_definitive_api_rejection_rotates_item_id_too(self, client, paypal):
+        paypal.simulator.inject(
+            "payout",
+            status=422,
+            body={"name": "VALIDATION_ERROR", "details": [{"issue": "RECEIVER_UNREGISTERED"}]},
+        )
+        order_id = create(client).json()["public_order_id"]
+        failed = next(
+            p
+            for p in client.post(f"{ORDERS}/{order_id}/capture").json()["payouts"]
+            if p["status"] == "FAILED"
+        )
+        assert failed["sender_batch_id"].endswith("-R1")
+        assert failed["sender_item_id"].endswith("-R1-ITEM")
+
+    def test_duplicate_request_id_parks_payout_until_reconciled(self, client, paypal):
+        sim = paypal.simulator
+        order_id = create(client).json()["public_order_id"]
+        sim.inject(
+            "payout",
+            status=400,
+            body={"name": "USER_BUSINESS_ERROR", "details": [{"issue": "DUPLICATE_REQUEST_ID"}]},
+        )
+        state = client.post(f"{ORDERS}/{order_id}/capture").json()
+        parked = next(p for p in state["payouts"] if p["status"] != "SUCCESS")
+        assert parked["status"] == "PROCESSING"  # not FAILED: retries are not wedged
+        assert "awaiting reconciliation" in parked["error_message"]
+        assert parked["sender_batch_id"].endswith(f"-V{parked['vendor_id']}")  # never rotated
+        assert state["status"] == "PAYOUTS_PENDING"
+
+        calls = sim.calls["payout"]
+        client.post(f"{ORDERS}/{order_id}/retry-payouts")
+        assert sim.calls["payout"] == calls  # never re-sent: that could pay twice
+
+        event = batch_event("PP-EXISTING-BATCH")
+        event["resource"]["batch_header"]["sender_batch_header"] = {
+            "sender_batch_id": parked["sender_batch_id"]
+        }
+        assert post_webhook(client, paypal, event).json()["status"] == "processed"
+        done = client.get(f"{ORDERS}/{order_id}").json()
+        assert done["status"] == "COMPLETED"
+        row = next(p for p in done["payouts"] if p["id"] == parked["id"])
+        assert row["paypal_payout_batch_id"] == "PP-EXISTING-BATCH"
+
+    def test_duplicate_with_known_batch_id_reconciles_by_polling(
+        self, client, paypal, seeded_session
+    ):
+        sim = paypal.simulator
+        order_id = create(client).json()["public_order_id"]
+        client.post(f"{ORDERS}/{order_id}/capture")
+        row = seeded_session.scalars(select(VendorPayout)).first()
+        seeded_session.refresh(row)
+        row.status = PayoutStatus.FAILED  # failed with a *known* PayPal batch id
+        seeded_session.commit()  # (commit before _order_row's expire_all)
+        order = _order_row(seeded_session, order_id)
+        order.status = OrderStatus.PAYOUTS_PARTIAL_FAILED
+        seeded_session.commit()
+        assert row.paypal_payout_batch_id is not None
+
+        sim.inject(
+            "payout",
+            status=400,
+            body={"name": "USER_BUSINESS_ERROR", "details": [{"issue": "DUPLICATE_REQUEST_ID"}]},
+        )
+        done = client.post(f"{ORDERS}/{order_id}/retry-payouts").json()
+        assert done["status"] == "COMPLETED"
+        assert sim.calls["get_payout"] == 1
+        assert len(sim.disbursements) == 3  # nothing paid twice
+
+
+class TestF303CaptureLeaseAndDraftRecovery:
+    def _hold_lease(self, session: Session, order_id: str, *, expired: bool = False) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        row = _order_row(session, order_id)
+        row.capture_lease_token = "someone-else"
+        row.capture_lease_until = datetime.now(UTC) + timedelta(seconds=-5 if expired else 60)
+        session.commit()
+
+    def test_concurrent_capture_is_refused_without_touching_stock(
+        self, client, paypal, seeded_session
+    ):
+        order_id = create(client).json()["public_order_id"]
+        before = stock(seeded_session, "BPE-TMP-58MM")
+        # Simulate an in-flight capture that already reserved stock and holds the lease.
+        row = _order_row(seeded_session, order_id)
+        reserve_stock(seeded_session, row)
+        self._hold_lease(seeded_session, order_id)
+        paypal.simulator.inject(
+            "capture",
+            status=422,
+            body={"name": "UNPROCESSABLE_ENTITY", "details": [{"issue": "INSTRUMENT_DECLINED"}]},
+        )
+        resp = client.post(f"{ORDERS}/{order_id}/capture")
+        assert resp.status_code == 409 and resp.json()["error"] == "capture_in_progress"
+        assert paypal.simulator.calls["capture"] == 0
+        state = _order_row(seeded_session, order_id)
+        assert state.stock_reserved is True  # the in-flight holder's reservation survives
+        assert stock(seeded_session, "BPE-TMP-58MM") == before - 2
+
+    def test_expired_lease_is_taken_over_and_released(self, client, paypal, seeded_session):
+        order_id = create(client).json()["public_order_id"]
+        self._hold_lease(seeded_session, order_id, expired=True)
+        assert client.post(f"{ORDERS}/{order_id}/capture").json()["status"] == "COMPLETED"
+        row = _order_row(seeded_session, order_id)
+        assert row.capture_lease_token is None and row.capture_lease_until is None
+
+    def test_lease_released_after_failure(self, client, paypal, seeded_session):
+        order = create(client).json()
+        paypal.simulator.mark_order_unapproved(order["paypal_order_id"])
+        assert client.post(f"{ORDERS}/{order['public_order_id']}/capture").status_code == 409
+        row = _order_row(seeded_session, order["public_order_id"])
+        assert row.capture_lease_token is None and row.stock_reserved is False
+
+    def test_capture_webhook_during_api_capture_is_deferred(self, client, paypal, seeded_session):
+        order = create(client).json()
+        self._hold_lease(seeded_session, order["public_order_id"])
+        event = capture_event(order["paypal_order_id"], "CAP-EXT", "277.78", event_id="WH-LATE")
+        assert post_webhook(client, paypal, event).status_code == 409  # PayPal will redeliver
+        assert seeded_session.scalar(select(func.count()).select_from(PayPalWebhookEvent)) == 0
+        self._hold_lease(seeded_session, order["public_order_id"], expired=True)
+        assert post_webhook(client, paypal, event).json()["status"] == "processed"
+
+    def test_integrity_error_winner_in_draft_is_completed(
+        self, client, paypal, seeded_session, monkeypatch
+    ):
+        real_build = settlement._build_order
+
+        def racing_build(session, items, **kwargs):
+            winner = real_build(seeded_session, items, **kwargs)  # same key + same payload
+            seeded_session.add(winner)
+            seeded_session.commit()  # ...and it dies before calling PayPal
+            return real_build(session, items, **kwargs)
+
+        monkeypatch.setattr(settlement, "_build_order", racing_build)
+        resp = create(client, key="race-draft-01")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "PAYPAL_ORDER_CREATED" and body["paypal_order_id"]
+        assert seeded_session.scalar(select(func.count()).select_from(Order)) == 1
+        assert paypal.simulator.calls["create_order"] == 1
+
+
+class TestF304WebhookCertUrl:
+    @pytest.mark.parametrize(
+        "url,trusted",
+        [
+            ("https://api.paypal.com/v1/notifications/certs/CERT-1", True),
+            ("https://api.sandbox.paypal.com/v1/notifications/certs/CERT-1", True),
+            ("https://paypal.com/cert", True),
+            ("https://API.PAYPAL.COM/cert", True),
+            ("http://api.paypal.com/v1/notifications/certs/CERT-1", False),
+            ("https://evil.com/api.paypal.com/cert", False),
+            ("https://paypal.com.evil.com/cert", False),
+            ("https://evilpaypal.com/cert", False),
+            ("https://user@api.paypal.com/cert", False),
+            ("https://api.paypal.com@evil.com/cert", False),
+            ("https://api.paypal.com:8443/cert", False),
+            ("ftp://api.paypal.com/cert", False),
+            ("//api.paypal.com/cert", False),
+            ("https://api.paypal.com:99999/cert", False),
+            ("", False),
+        ],
+    )
+    def test_trusted_cert_url(self, url, trusted):
+        assert is_trusted_paypal_cert_url(url) is trusted
+
+    @pytest.mark.parametrize(
+        "cert_url", ["http://api.sandbox.paypal.com/certs/x", "https://attacker.example/cert"]
+    )
+    def test_webhook_with_untrusted_cert_url_is_rejected(self, client, paypal, cert_url):
+        order = create(client).json()
+        event = capture_event(order["paypal_order_id"], "CAP-EXT", "277.78")
+        headers = {**simulate_webhook_headers(paypal.settings, event), "paypal-cert-url": cert_url}
+        assert post_webhook(client, paypal, event, headers=headers).status_code == 400
+        assert client.get(f"{ORDERS}/{order['public_order_id']}").json()["status"] == (
+            "PAYPAL_ORDER_CREATED"
+        )
+
+    def test_live_verification_never_forwards_untrusted_cert(self):
+        fake = RecordingPayPal(
+            {
+                ("POST", "/v1/notifications/verify-webhook-signature"): httpx.Response(
+                    200, json={"verification_status": "SUCCESS"}
+                )
+            }
+        )
+        pp = fake.client(paypal_webhook_id="WH-LIVE")
+        headers = {
+            "paypal-auth-algo": "SHA256withRSA",
+            "paypal-cert-url": "https://attacker.example/cert.pem",
+            "paypal-transmission-id": "t",
+            "paypal-transmission-sig": "s",
+            "paypal-transmission-time": "2026-10-25T00:00:00Z",
+        }
+        assert run(pp.verify_webhook_signature(headers=headers, event={"id": "x"})) is False
+        assert not any(r.url.path.endswith("verify-webhook-signature") for r in fake.requests)
+
+
+class TestCorsForCommandCenter:
+    @pytest.mark.parametrize("origin", ["http://localhost:5173", "http://127.0.0.1:5173"])
+    def test_vite_dev_origins_allowed(self, client: TestClient, origin):
+        resp = client.options(
+            ORDERS,
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,idempotency-key",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.headers["access-control-allow-origin"] == origin
+        assert "idempotency-key" in resp.headers["access-control-allow-headers"].lower()
+        get = client.get("/api/v1/health", headers={"Origin": origin})
+        assert get.headers["access-control-allow-origin"] == origin
+
+    def test_other_origins_refused(self, client: TestClient):
+        resp = client.get("/api/v1/health", headers={"Origin": "https://evil.example"})
+        assert "access-control-allow-origin" not in resp.headers
