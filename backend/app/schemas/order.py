@@ -105,7 +105,7 @@ class OrderListResponse(BaseModel):
 
 
 class WebhookAck(BaseModel):
-    status: Literal["processed", "duplicate", "ignored"]
+    status: Literal["processed", "duplicate", "ignored", "rejected"]
     event_id: str
     event_type: str
     detail: str

@@ -52,12 +52,20 @@ class DatabaseHealth(BaseModel):
     error: str | None = None
 
 
+class IntegrationsHealth(BaseModel):
+    parser_mode: str  # "gemini" | "deterministic_fallback"
+    parser_model: str
+    paypal_mode: str | None  # "live_sandbox" | "sandbox_simulation" | None (not configured)
+    paypal_env: str
+
+
 class HealthResponse(BaseModel):
     status: str
     app: str
     environment: str
     database: DatabaseHealth
     active_sku_count: int
+    integrations: IntegrationsHealth
 
 
 # --- match preview -----------------------------------------------------------------------
@@ -68,6 +76,8 @@ class MatchPreviewItem(BaseModel):
 
     query: str = Field(min_length=1, max_length=500, examples=["arabica beans half kg"])
     quantity: StrictInt = Field(ge=1, le=100_000, examples=[4])
+    # Operator override: resolve this line to exactly this SKU (e.g. picked from candidates).
+    sku_code: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9-]+$")
 
     @field_validator("query")
     @classmethod
@@ -110,6 +120,7 @@ class LineItemPreview(BaseModel):
     quantity: int
     match_status: MatchStatus
     is_ambiguous: bool
+    is_pinned: bool = False
     matched_sku: CandidateOut | None
     candidates: list[CandidateOut]
     stock_status: StockStatus
