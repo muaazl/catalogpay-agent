@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings or they break inside Linux containers.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.png binary
