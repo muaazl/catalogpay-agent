@@ -95,6 +95,10 @@ class Order(Base):
     capture_request_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     # True once stock has been deducted for this order; makes capture retries deduct only once.
     stock_reserved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Capture mutex: only the invocation holding an unexpired lease may capture, reserve or
+    # release stock, so a failing concurrent call can never undo an in-flight capture.
+    capture_lease_token: Mapped[str | None] = mapped_column(String(32))
+    capture_lease_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
     last_error: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=_utcnow)
@@ -189,6 +193,9 @@ class VendorPayout(Base):
     paypal_payout_item_id: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(16), nullable=False, default=PayoutStatus.PENDING)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Bumped on every definitive rejection; sender_batch_id *and* sender_item_id carry it, so a
+    # late webhook about an earlier generation can never match the active attempt.
+    retry_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
