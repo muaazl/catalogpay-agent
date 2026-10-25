@@ -1,10 +1,16 @@
 """Application settings loaded from environment variables (and an optional .env file)."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# backend/app/core/config.py -> repository root (same layout inside the Docker image: /app).
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_RETURN_URL = "http://localhost:5173/checkout/return"
+DEFAULT_CANCEL_URL = "http://localhost:5173/checkout/cancel"
 
 
 class Settings(BaseSettings):
@@ -22,8 +28,17 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./catalogpay.db"
     database_echo: bool = False
     seed_on_startup: bool = True
+    # One completed multi-vendor order (ORD-DEMO00000001) so the ledger is never empty in demos.
+    seed_demo_orders: bool = True
+
+    # Built React app to serve from FastAPI in production. Empty -> auto-detect frontend/dist.
+    static_dist_dir: str = ""
+    # Set by Render on every web service; used to derive PayPal return/cancel URLs.
+    render_external_url: str = ""
 
     default_currency: str = Field(default="USD", min_length=3, max_length=3)
+    # Browser origins allowed to call the API (the Vite dev server by default).
+    cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     # Hybrid matcher decision thresholds (confidence is normalized to 0.0-1.0).
     match_confidence_threshold: float = Field(default=0.62, ge=0.0, le=1.0)
@@ -45,11 +60,18 @@ class Settings(BaseSettings):
     paypal_webhook_id: str = ""
     paypal_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
     paypal_sandbox_mock_fallback: bool = True
-    paypal_return_url: str = "http://localhost:5173/checkout/return"
-    paypal_cancel_url: str = "http://localhost:5173/checkout/cancel"
+    paypal_return_url: str = DEFAULT_RETURN_URL
+    paypal_cancel_url: str = DEFAULT_CANCEL_URL
     paypal_brand_name: str = Field(default="CatalogPay", max_length=127)
     # Signs simulated webhooks so the simulation endpoint cannot be trivially forged.
     paypal_simulation_secret: str = Field(default="catalogpay-local-simulation", repr=False)
+
+    def resolved_static_dist(self) -> Path | None:
+        """The built frontend directory to serve, or None when there is nothing to serve."""
+        candidate = (
+            Path(self.static_dist_dir) if self.static_dist_dir else REPO_ROOT / "frontend/dist"
+        )
+        return candidate if (candidate / "index.html").is_file() else None
 
     @property
     def paypal_credentials_configured(self) -> bool:
@@ -59,6 +81,17 @@ class Settings(BaseSettings):
     def _check_thresholds(self) -> "Settings":
         if self.low_confidence_threshold > self.match_confidence_threshold:
             raise ValueError("LOW_CONFIDENCE_THRESHOLD must not exceed MATCH_CONFIDENCE_THRESHOLD")
+        return self
+
+    @model_validator(mode="after")
+    def _derive_public_urls(self) -> "Settings":
+        # On Render the SPA is served from the service's own URL; send PayPal buyers back there.
+        base = self.render_external_url.rstrip("/")
+        if base:
+            if self.paypal_return_url == DEFAULT_RETURN_URL:
+                self.paypal_return_url = f"{base}/checkout/return"
+            if self.paypal_cancel_url == DEFAULT_CANCEL_URL:
+                self.paypal_cancel_url = f"{base}/checkout/cancel"
         return self
 
     @model_validator(mode="after")
