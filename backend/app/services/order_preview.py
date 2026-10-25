@@ -52,6 +52,7 @@ class _ResolvedLine:
     normalized_query: str
     status: MatchStatus
     is_ambiguous: bool
+    is_pinned: bool
     candidates: list[CandidateOut]
     best: MatchCandidate | None
     stock_status: StockStatus
@@ -78,7 +79,10 @@ def _resolve(
     reserved: defaultdict[int, int] = defaultdict(int)  # sku_id -> qty claimed by earlier lines
     lines: list[_ResolvedLine] = []
     for index, item in enumerate(items):
-        result = matcher.match(item.query, top_k=top_k)
+        if item.sku_code:
+            result = matcher.match_pinned(item.query, item.sku_code, top_k=top_k)
+        else:
+            result = matcher.match(item.query, top_k=top_k)
         best = result.best if result.status is MatchStatus.MATCHED else None
         line = _ResolvedLine(
             index=index,
@@ -86,12 +90,15 @@ def _resolve(
             normalized_query=result.normalized_query,
             status=result.status,
             is_ambiguous=result.is_ambiguous,
+            is_pinned=bool(item.sku_code),
             candidates=[_candidate_out(c) for c in result.candidates],
             best=best,
             stock_status=StockStatus.NOT_APPLICABLE,
             available=None,
         )
-        if result.status is MatchStatus.UNMATCHED:
+        if result.status is MatchStatus.UNMATCHED and item.sku_code:
+            line.issues.append(f"Pinned SKU {item.sku_code} is not available in the catalog.")
+        elif result.status is MatchStatus.UNMATCHED:
             line.issues.append("No catalog SKU matched this item with sufficient confidence.")
         elif result.status is MatchStatus.LOW_CONFIDENCE:
             reason = "candidates are too close to call" if result.is_ambiguous else "low score"
@@ -162,6 +169,7 @@ def build_match_preview(
             quantity=ln.item.quantity,
             match_status=ln.status,
             is_ambiguous=ln.is_ambiguous,
+            is_pinned=ln.is_pinned,
             matched_sku=_candidate_out(ln.best) if ln.best is not None else None,
             candidates=ln.candidates,
             stock_status=ln.stock_status,
