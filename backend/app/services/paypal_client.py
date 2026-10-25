@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -136,6 +137,7 @@ class PayPalCaptureResult:
     capture_id: str | None
     capture_status: str | None
     amount_cents: int | None
+    currency: str | None
     raw: dict[str, Any]
 
 
@@ -263,13 +265,19 @@ def _parse_capture(body: dict[str, Any]) -> PayPalCaptureResult:
         if captures:
             capture = captures[0]
             break
-    amount = (capture.get("amount") or {}).get("value")
+    amount_obj = capture.get("amount") if isinstance(capture.get("amount"), dict) else {}
+    amount, currency = amount_obj.get("value"), amount_obj.get("currency_code")
+    try:
+        amount_cents = parse_paypal_amount(amount) if isinstance(amount, str) else None
+    except ValueError:
+        amount_cents = None  # unparseable amounts are treated as missing -> fails verification
     return PayPalCaptureResult(
         order_id=str(body.get("id", "")),
         status=str(body.get("status", "")),
         capture_id=capture.get("id"),
         capture_status=capture.get("status"),
-        amount_cents=parse_paypal_amount(amount) if isinstance(amount, str) else None,
+        amount_cents=amount_cents,
+        currency=currency if isinstance(currency, str) and currency else None,
         raw=body,
     )
 
@@ -299,6 +307,23 @@ def _safe_id(value: str, what: str) -> str:
     if not _ID_RE.match(value or ""):
         raise PayPalAPIError(f"Invalid {what} {value!r}", http_status=400, name="INVALID_ID")
     return value
+
+
+def is_trusted_paypal_cert_url(url: str) -> bool:
+    """``https://`` on ``paypal.com`` or a subdomain, default port, no credentials."""
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower().rstrip(".")
+    return (
+        parts.scheme == "https"
+        and parts.username is None
+        and parts.password is None
+        and port in (None, 443)
+        and (host == "paypal.com" or host.endswith(".paypal.com"))
+    )
 
 
 WEBHOOK_HEADERS: Final = {
@@ -570,6 +595,8 @@ class PayPalClient:
         fields = {key: lowered.get(header, "") for key, header in WEBHOOK_HEADERS.items()}
         if not all(fields.values()):
             return False
+        if not is_trusted_paypal_cert_url(fields["cert_url"]):
+            return False  # never let PayPal (or anyone) fetch a cert from an attacker's host
         body = await self._api(
             "POST",
             "/v1/notifications/verify-webhook-signature",
