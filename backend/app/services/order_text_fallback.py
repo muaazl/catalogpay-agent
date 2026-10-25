@@ -151,23 +151,38 @@ def _clean_query(text: str) -> str:
     return text[:500]
 
 
+def _fragments(text: str, notes: list[str]) -> list[str]:
+    """Split into candidate item fragments; whole note lines go to ``notes`` unsplit.
+
+    Notes are detected per *line* before comma/conjunction splitting, so "Note: deliver by
+    7am, back door" stays one note instead of leaking "back door" in as an order line.
+    """
+    fragments: list[str] = []
+    for raw_line in re.split(r"\r?\n", text):
+        line = _BULLET_RE.sub("", raw_line.strip()).strip()
+        note_match = _NOTE_RE.match(line)
+        if note_match:
+            if note := note_match.group("note").strip():
+                notes.append(note)
+            continue
+        fragments.extend(f.strip() for f in _SPLIT_RE.split(raw_line) if f and f.strip())
+    return fragments
+
+
 def parse_text_deterministic_fallback(text: str) -> GeminiExtractionPayload:
     items: list[ExtractedLineItem] = []
     unrecognized: list[str] = []
     notes: list[str] = []
 
-    for raw in _SPLIT_RE.split(text):
-        fragment = (raw or "").strip()
-        if not fragment:
-            continue
+    for fragment in _fragments(text, notes):
         line = _BULLET_RE.sub("", fragment).strip()
         if not line:
             continue
 
-        note_match = _NOTE_RE.match(line)
+        note_match = _NOTE_RE.match(line)  # inline note after a comma: "2 yeast, note: urgent"
         if note_match:
-            if note_match.group("note").strip():
-                notes.append(note_match.group("note").strip())
+            if note := note_match.group("note").strip():
+                notes.append(note)
             continue
         has_digit = any(ch.isdigit() for ch in line)
         if not has_digit and (_GREETING_RE.match(line) or line.endswith(":")):
