@@ -2,15 +2,17 @@ from fastapi import APIRouter, Response, status
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.deps import AppSettings, DbSession
+from app.api.deps import AppSettings, DbSession, PayPal
 from app.models.catalog import ProductSKU, Vendor
-from app.schemas.catalog import DatabaseHealth, HealthResponse
+from app.schemas.catalog import DatabaseHealth, HealthResponse, IntegrationsHealth
 
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse)
-def health(db: DbSession, settings: AppSettings, response: Response) -> HealthResponse:
+def health(
+    db: DbSession, settings: AppSettings, paypal: PayPal, response: Response
+) -> HealthResponse:
     dialect = db.get_bind().dialect.name
     try:
         db.execute(text("SELECT 1"))
@@ -32,4 +34,10 @@ def health(db: DbSession, settings: AppSettings, response: Response) -> HealthRe
         environment=settings.environment,
         database=database,
         active_sku_count=active_count,
+        integrations=IntegrationsHealth(
+            parser_mode="gemini" if settings.gemini_api_key.strip() else "deterministic_fallback",
+            parser_model=settings.gemini_model if settings.gemini_api_key.strip() else "regex",
+            paypal_mode=str(paypal.mode) if paypal.mode else None,
+            paypal_env=settings.paypal_env,
+        ),
     )
