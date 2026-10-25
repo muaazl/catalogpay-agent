@@ -25,10 +25,10 @@ import logging
 import secrets
 from collections import defaultdict
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -90,6 +90,25 @@ class OrderNotApprovedError(DomainError):
 
 class PaymentDeclinedError(DomainError):
     status_code, code = 402, "payment_declined"
+
+
+class PayPalCaptureVerificationError(DomainError):
+    """PayPal's capture does not match the ledger (amount, currency, or missing data)."""
+
+    status_code, code = 502, "capture_verification_failed"
+
+
+class CaptureInProgressError(DomainError):
+    status_code, code = 409, "capture_in_progress"
+
+
+CAPTURE_LEASE_SECONDS = 120
+_DUPLICATE_PAYOUT_ISSUES = (
+    "DUPLICATE_REQUEST_ID",
+    "SENDER_BATCH_ID_ALREADY_USED",
+    "BATCH_ALREADY_EXISTS",
+    "DUPLICATE_SENDER_BATCH_ID",
+)
 
 
 _CAPTURED_STATES = frozenset(
@@ -167,6 +186,7 @@ def _build_order(
     parser_mode: str | None,
     currency: str,
     paypal_mode: str,
+    public_order_id: str | None = None,
 ) -> Order:
     codes = {i.sku_code.upper() for i in items}
     skus = {
@@ -214,7 +234,7 @@ def _build_order(
                 net_vendor_payout_cents=0,
             )
         )
-    public_order_id = _new_public_order_id()
+    public_order_id = public_order_id or _new_public_order_id()
     by_vendor: defaultdict[int, list[OrderLineItem]] = defaultdict(list)
     for line in lines:
         by_vendor[line.vendor_id].append(line)
@@ -240,8 +260,8 @@ def _build_order(
                 gross_subtotal_cents=gross,
                 platform_fee_cents=fee_total,
                 payout_amount_cents=gross - fee_total,
-                sender_batch_id=f"{public_order_id}-V{vendor_id}",
-                sender_item_id=f"{public_order_id}-V{vendor_id}-ITEM",
+                sender_batch_id=payout_ids(public_order_id, vendor_id, 0)[0],
+                sender_item_id=payout_ids(public_order_id, vendor_id, 0)[1],
                 status=PayoutStatus.PENDING,
             )
         )
@@ -348,7 +368,12 @@ async def create_order_from_items(
         winner = session.scalar(select(Order).where(Order.idempotency_key == idempotency_key))
         if winner is None:
             raise
-        return load_order(session, _replay(winner).public_order_id), False
+        winner = _replay(winner)
+        if winner.status == OrderStatus.DRAFT and winner.paypal_order_id is None:
+            # The winner may have died before reaching PayPal; finishing it here is safe because
+            # the create request id is stable, so PayPal returns the same order either way.
+            await _open_paypal_order(session, paypal, load_order(session, winner.public_order_id))
+        return load_order(session, winner.public_order_id), False
 
     await _open_paypal_order(session, paypal, order)
     return load_order(session, order.public_order_id), True
@@ -423,6 +448,42 @@ def release_stock(session: Session, order: Order) -> None:
 # --------------------------------------------------------------------------------------------
 
 
+def verify_capture(order: Order, *, amount_cents: int | None, currency: str | None) -> None:
+    """Raise unless PayPal captured exactly the ledger total, in the ledger currency.
+
+    Missing data is a failure, never a pass: an unverifiable capture must not release money
+    to vendors.
+    """
+    problems: list[str] = []
+    if amount_cents is None:
+        problems.append("PayPal reported no captured amount")
+    elif amount_cents != order.gross_subtotal_cents:
+        problems.append(
+            f"captured {amount_cents} cents but ledger total is {order.gross_subtotal_cents}"
+        )
+    if not currency:
+        problems.append("PayPal reported no capture currency")
+    elif currency.upper() != order.currency.upper():
+        problems.append(f"captured in {currency.upper()} but order is in {order.currency}")
+    if problems:
+        raise PayPalCaptureVerificationError(
+            f"Capture verification failed for {order.public_order_id}: "
+            + "; ".join(problems)
+            + ". Vendor payouts are blocked pending review."
+        )
+
+
+def _flag_capture_problem(
+    session: Session, order: Order, *, capture_id: str | None, reason: str
+) -> None:
+    """Record what PayPal reported for operators without advancing the order state."""
+    order.paypal_capture_id = capture_id or order.paypal_capture_id
+    order.payout_hold_reason = reason[:255]
+    order.last_error = reason
+    logger.error("Capture verification failed: %s", reason)
+    session.commit()
+
+
 def _record_capture(
     session: Session,
     order: Order,
@@ -430,17 +491,46 @@ def _record_capture(
     capture_id: str | None,
     capture_status: str | None,
     amount_cents: int | None,
+    currency: str | None,
 ) -> None:
+    verify_capture(order, amount_cents=amount_cents, currency=currency)  # before any mutation
     order.paypal_capture_id = capture_id or order.paypal_capture_id
     order.paypal_capture_status = capture_status
     order.captured_at = order.captured_at or _now()
     order.status = OrderStatus.CAPTURED
     order.last_error = None
-    if amount_cents is not None and amount_cents != order.gross_subtotal_cents:
-        order.payout_hold_reason = (
-            f"Captured {amount_cents} cents but ledger total is {order.gross_subtotal_cents}."
+    session.commit()
+
+
+def _acquire_capture_lease(session: Session, order: Order) -> str | None:
+    token = secrets.token_hex(8)
+    now = _now()
+    claimed = session.execute(
+        update(Order)
+        .where(
+            Order.id == order.id,
+            or_(Order.capture_lease_until.is_(None), Order.capture_lease_until < now),
         )
-        logger.error("Capture amount mismatch on %s", order.public_order_id)
+        .values(
+            capture_lease_token=token,
+            capture_lease_until=now + timedelta(seconds=CAPTURE_LEASE_SECONDS),
+            updated_at=Order.updated_at,  # lease bookkeeping is not a business change
+        )
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    session.commit()
+    session.refresh(order)
+    return token if claimed == 1 else None
+
+
+def _release_capture_lease(session: Session, order: Order, token: str) -> None:
+    session.rollback()  # discard anything a failed step left half-done
+    session.execute(
+        update(Order)
+        .where(Order.id == order.id, Order.capture_lease_token == token)
+        .values(capture_lease_token=None, capture_lease_until=None, updated_at=Order.updated_at)
+        .execution_options(synchronize_session=False)
+    )
     session.commit()
 
 
@@ -471,6 +561,21 @@ async def capture_order_and_disburse(
     if order.status != OrderStatus.PAYPAL_ORDER_CREATED:
         raise OrderStateError(f"Order {public_order_id} cannot be captured in {order.status}.")
 
+    token = _acquire_capture_lease(session, order)
+    if token is None:
+        raise CaptureInProgressError(
+            f"Another capture of {public_order_id} is in progress; retry shortly."
+        )
+    try:
+        await _capture_under_lease(session, paypal, order)
+    finally:
+        _release_capture_lease(session, order, token)
+    return load_order(session, public_order_id)
+
+
+async def _capture_under_lease(session: Session, paypal: PayPalClient, order: Order) -> None:
+    # Holding the lease makes this the only invocation touching this order's stock, so the
+    # reservation (ours, or one left by an earlier ambiguous attempt) is ours to release.
     reserve_stock(session, order)  # raises InsufficientStockError before any money moves
     try:
         capture = await _capture_with_recovery(paypal, order)
@@ -493,15 +598,21 @@ async def capture_order_and_disburse(
         session.commit()
         raise
 
-    _record_capture(
-        session,
-        order,
-        capture_id=capture.capture_id,
-        capture_status=capture.capture_status,
-        amount_cents=capture.amount_cents,
-    )
+    try:
+        _record_capture(
+            session,
+            order,
+            capture_id=capture.capture_id,
+            capture_status=capture.capture_status,
+            amount_cents=capture.amount_cents,
+            currency=capture.currency,
+        )
+    except PayPalCaptureVerificationError as exc:
+        # Funds may have moved, so stock stays reserved; but the order is NOT advanced and no
+        # vendor is paid. A retry re-reads the same capture and re-verifies.
+        _flag_capture_problem(session, order, capture_id=capture.capture_id, reason=exc.message)
+        raise
     await disburse_payouts(session, paypal, order)
-    return load_order(session, public_order_id)
 
 
 # --------------------------------------------------------------------------------------------
@@ -509,14 +620,26 @@ async def capture_order_and_disburse(
 # --------------------------------------------------------------------------------------------
 
 
+def payout_ids(public_order_id: str, vendor_id: int, generation: int) -> tuple[str, str]:
+    """``(sender_batch_id, sender_item_id)`` for a vendor payout's retry generation."""
+    base = f"{public_order_id}-V{vendor_id}"
+    if generation:
+        base = f"{base}-R{generation}"
+    return base, f"{base}-ITEM"
+
+
 def _mark_payout_failed(payout: VendorPayout, message: str, *, definitive: bool) -> None:
     payout.status = PayoutStatus.FAILED
     payout.error_message = message[:2000]
     if definitive:
-        # Nothing was paid, so a fresh id is safe and avoids PayPal's duplicate-id rejection.
-        base = payout.sender_batch_id.split("-R", 1)[0]
-        payout.sender_batch_id = f"{base}-R{payout.attempt_count}"
+        # Nothing was paid, so fresh ids are safe and avoid PayPal's duplicate-id rejection.
+        # Both ids rotate together: a late webhook about the old generation then matches nothing.
+        payout.retry_generation += 1
+        payout.sender_batch_id, payout.sender_item_id = payout_ids(
+            payout.order.public_order_id, payout.vendor_id, payout.retry_generation
+        )
         payout.paypal_payout_batch_id = None
+        payout.paypal_payout_item_id = None
 
 
 def _apply_batch_result(payout: VendorPayout, batch: PayPalPayoutBatchResult) -> None:
@@ -583,12 +706,34 @@ async def _submit_payout(
     except PayPalUnavailableError as exc:
         _mark_payout_failed(payout, f"Ambiguous: {exc.message}", definitive=False)
     except PayPalAPIError as exc:
-        # A duplicate-id rejection means an earlier attempt *did* create the batch.
-        definitive = not exc.has_issue("DUPLICATE_REQUEST_ID", "SENDER_BATCH_ID_ALREADY_USED")
-        _mark_payout_failed(payout, exc.message, definitive=definitive)
+        if exc.has_issue(*_DUPLICATE_PAYOUT_ISSUES):
+            await _reconcile_duplicate_batch(paypal, payout)
+        else:
+            _mark_payout_failed(payout, exc.message, definitive=True)
     else:
         _apply_batch_result(payout, batch)
     session.commit()
+
+
+async def _reconcile_duplicate_batch(paypal: PayPalClient, payout: VendorPayout) -> None:
+    """PayPal already holds a batch under this sender_batch_id, so an earlier attempt *did*
+    create it and money may have moved. Rotating ids would risk paying twice, and marking it
+    FAILED would wedge retries. Read the batch back if we know its id; otherwise park it as
+    PROCESSING until the batch/item webhook (matched by sender_batch_id) reconciles it.
+    """
+    if payout.paypal_payout_batch_id:
+        try:
+            _apply_batch_result(
+                payout, await paypal.get_payout_batch(payout.paypal_payout_batch_id)
+            )
+            return
+        except (PayPalUnavailableError, PayPalAPIError):
+            pass
+    payout.status = PayoutStatus.PROCESSING
+    payout.error_message = (
+        f"PayPal already has batch {payout.sender_batch_id}; awaiting reconciliation. "
+        "No new payout will be sent."
+    )
 
 
 async def _poll_payout(paypal: PayPalClient, payout: VendorPayout) -> None:
@@ -607,7 +752,8 @@ async def disburse_payouts(
 ) -> None:
     if order.status not in _CAPTURED_STATES or order.status == OrderStatus.COMPLETED:
         return
-    if order.payout_hold_reason or order.paypal_capture_status not in (None, "COMPLETED"):
+    # Pay vendors only for a verified, fully completed capture. ``None`` is not "completed".
+    if order.payout_hold_reason or order.paypal_capture_status != "COMPLETED":
         refresh_order_status(order)
         session.commit()
         return
@@ -655,27 +801,63 @@ async def _on_capture_completed(
     if order is None:
         return f"ignored: no order for PayPal order {paypal_order_id}"
     order = load_order(session, order.public_order_id)
-    amount = (resource.get("amount") or {}).get("value")
-    amount_cents = parse_paypal_amount(amount) if isinstance(amount, str) else None
+    capture_id = resource.get("id")
+    amount_obj = resource.get("amount") if isinstance(resource.get("amount"), dict) else {}
+    try:
+        value = amount_obj.get("value")
+        amount_cents = parse_paypal_amount(value) if isinstance(value, str) else None
+    except ValueError:
+        amount_cents = None
+    currency = (
+        amount_obj.get("currency_code")
+        if isinstance(amount_obj.get("currency_code"), str)
+        else None
+    )
+
+    def _reject(reason: str) -> str:
+        _flag_capture_problem(session, order, capture_id=capture_id, reason=reason)
+        return f"rejected: {reason}"
 
     if order.status == OrderStatus.PAYPAL_ORDER_CREATED:
-        # Captured outside our capture endpoint: adopt it (deduct stock, then pay vendors).
+        # Captured outside our capture endpoint: adopt it (deduct stock, then pay vendors) -
+        # but only once the capture is proven to match the ledger.
         try:
-            reserve_stock(session, order)
-        except InsufficientStockError as exc:
-            order.payout_hold_reason = "Captured externally but stock was insufficient."
-            order.last_error = exc.message
-        _record_capture(
-            session,
-            order,
-            capture_id=resource.get("id"),
-            capture_status="COMPLETED",
-            amount_cents=amount_cents,
-        )
-        await disburse_payouts(session, paypal, order)
+            verify_capture(order, amount_cents=amount_cents, currency=currency)
+        except PayPalCaptureVerificationError as exc:
+            return _reject(exc.message)
+        token = _acquire_capture_lease(session, order)
+        if token is None:  # API capture in flight: let PayPal redeliver later
+            raise CaptureInProgressError(f"Capture of {order.public_order_id} in progress.")
+        try:
+            try:
+                reserve_stock(session, order)
+            except InsufficientStockError as exc:
+                order.payout_hold_reason = "Captured externally but stock was insufficient."
+                order.last_error = exc.message
+                session.commit()
+            _record_capture(
+                session,
+                order,
+                capture_id=capture_id,
+                capture_status="COMPLETED",
+                amount_cents=amount_cents,
+                currency=currency,
+            )
+            await disburse_payouts(session, paypal, order)
+        finally:
+            _release_capture_lease(session, order, token)
         return f"captured {order.public_order_id} from webhook"
     if order.status in _CAPTURED_STATES and order.paypal_capture_status != "COMPLETED":
-        order.paypal_capture_status = "COMPLETED"  # pending capture has now cleared
+        # A PENDING capture has cleared. Re-verify: this event is what releases vendor money.
+        if order.paypal_capture_id and capture_id != order.paypal_capture_id:
+            return _reject(
+                f"webhook capture {capture_id} does not match recorded {order.paypal_capture_id}"
+            )
+        try:
+            verify_capture(order, amount_cents=amount_cents, currency=currency)
+        except PayPalCaptureVerificationError as exc:
+            return _reject(exc.message)
+        order.paypal_capture_status = "COMPLETED"
         session.commit()
         await disburse_payouts(session, paypal, order)
         return f"capture cleared for {order.public_order_id}"
@@ -688,6 +870,19 @@ def _on_payout_batch(session: Session, resource: dict[str, Any], *, success: boo
     payouts = session.scalars(
         select(VendorPayout).where(VendorPayout.paypal_payout_batch_id == batch_id)
     ).all()
+    if not payouts:
+        # A batch we created but never learned the id of (lost response + duplicate on retry):
+        # reconcile by the *current* generation's sender_batch_id. Rotated ids never match.
+        sender_batch_id = (header.get("sender_batch_header") or {}).get("sender_batch_id")
+        if sender_batch_id:
+            payouts = session.scalars(
+                select(VendorPayout).where(
+                    VendorPayout.sender_batch_id == sender_batch_id,
+                    VendorPayout.paypal_payout_batch_id.is_(None),
+                )
+            ).all()
+            for payout in payouts:
+                payout.paypal_payout_batch_id = batch_id
     if not payouts:
         return f"ignored: unknown payout batch {batch_id}"
     for payout in payouts:
@@ -758,6 +953,8 @@ async def handle_paypal_webhook(
         status, detail = "ignored", f"unhandled event type {event_type}"
     if detail.startswith("ignored"):
         status = "ignored"
+    elif detail.startswith("rejected"):
+        status = "rejected"
 
     session.add(
         PayPalWebhookEvent(
