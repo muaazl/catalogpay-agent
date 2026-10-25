@@ -283,6 +283,7 @@ class HybridSKUMatcher:
         if low_confidence_threshold > match_threshold:
             raise ValueError("low_confidence_threshold must not exceed match_threshold")
         self.entries: tuple[CatalogEntry, ...] = tuple(entries)
+        self._by_code = {e.sku_code.upper(): e for e in self.entries}
         self.match_threshold = match_threshold
         self.low_confidence_threshold = low_confidence_threshold
 
@@ -363,6 +364,36 @@ class HybridSKUMatcher:
         if confidence >= self.low_confidence_threshold:
             return MatchStatus.LOW_CONFIDENCE
         return MatchStatus.UNMATCHED
+
+    def match_pinned(self, query: str, sku_code: str, top_k: int = 3) -> MatchResult:
+        """Resolve ``query`` to an operator-chosen SKU, keeping the matcher's alternatives.
+
+        Returns UNMATCHED if the pinned SKU is not active in this catalog.
+        """
+        base = self.match(query, top_k=top_k)
+        entry = self._by_code.get(sku_code.strip().upper())
+        if entry is None:
+            return MatchResult(
+                base.query, base.normalized_query, MatchStatus.UNMATCHED, base.candidates
+            )
+        previous = next((c for c in base.candidates if c.entry.sku_code == entry.sku_code), None)
+        model_view = (
+            f"matcher scored it {previous.confidence_score:.2f}"
+            if previous
+            else "not in matcher top-k"
+        )
+        pinned = MatchCandidate(
+            entry=entry,
+            confidence_score=1.0,
+            fuzzy_score=previous.fuzzy_score if previous else 0.0,
+            vector_score=previous.vector_score if previous else 0.0,
+            unit_score=previous.unit_score if previous else None,
+            match_reasoning=f"Pinned by operator ({model_view})",
+        )
+        others = tuple(c for c in base.candidates if c.entry.sku_code != entry.sku_code)
+        return MatchResult(
+            base.query, base.normalized_query, MatchStatus.MATCHED, (pinned, *others)[:top_k]
+        )
 
     def match(self, query: str, top_k: int = 3) -> MatchResult:
         if top_k < 1:
