@@ -272,22 +272,9 @@ class PayPalSimulator:
     def _capture(self, request: httpx.Request, order_id: str) -> httpx.Response:
         order = self.orders.get(order_id)
         if order is None:
-            if not order_id.startswith("SIM-ORDER-"):
-                return self._error(
-                    404, "RESOURCE_NOT_FOUND", "Order not found", "INVALID_RESOURCE_ID"
-                )
-            # Simulator restarted since the order was created: capture it without an amount.
-            capture_id = f"SIM-CAPTURE-{_digest(order_id)}"
-            return httpx.Response(
-                201,
-                json={
-                    "id": order_id,
-                    "status": "COMPLETED",
-                    "purchase_units": [
-                        {"payments": {"captures": [{"id": capture_id, "status": "COMPLETED"}]}}
-                    ],
-                },
-            )
+            # Unknown (e.g. the simulator restarted): like PayPal, refuse rather than invent a
+            # capture whose amount could not be verified against the ledger.
+            return self._error(404, "RESOURCE_NOT_FOUND", "Order not found", "INVALID_RESOURCE_ID")
         if order.status == "PAYER_ACTION_REQUIRED_STRICT":
             return self._error(
                 422, "UNPROCESSABLE_ENTITY", "Payer has not approved", "ORDER_NOT_APPROVED"
