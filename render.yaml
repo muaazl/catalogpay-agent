@@ -1,0 +1,52 @@
+# Render Blueprint: one-click deploy of CatalogPay Agent (API + React Command Center).
+# https://render.com/docs/blueprint-spec
+#
+# Works with zero secrets: without Gemini/PayPal keys the app runs the deterministic parser
+# and the in-process PayPal sandbox simulation, so judges can click through the full flow.
+services:
+  - type: web
+    name: catalogpay-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Persistent disks need a paid instance. On the free plan, delete the `disk` block: SQLite
+    # then lives in the container and is re-seeded (catalog + demo history) on every deploy.
+    plan: starter
+    region: oregon
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    disk:
+      name: catalogpay-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        value: sqlite:////data/catalogpay.db
+      - key: SEED_ON_STARTUP
+        value: "true"
+      - key: SEED_DEMO_ORDERS
+        value: "true"
+      # --- Gemini 2.5 Flash (optional: enables image/PDF/voice parsing) ---
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      # --- PayPal Sandbox (optional: without credentials -> sandbox_simulation) ---
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_WEBHOOK_ID
+        sync: false
+      - key: PAYPAL_ENV
+        value: sandbox
+      - key: PAYPAL_BASE_URL
+        value: https://api-m.sandbox.paypal.com
+      - key: PAYPAL_SANDBOX_MOCK_FALLBACK
+        value: "true"
+      # Signs simulated webhooks; unique per deployment.
+      - key: PAYPAL_SIMULATION_SECRET
+        generateValue: true
+      # PayPal return/cancel URLs are derived from RENDER_EXTERNAL_URL, which Render injects.
