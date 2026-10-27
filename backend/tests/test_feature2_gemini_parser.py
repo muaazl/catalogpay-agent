@@ -294,7 +294,7 @@ class TestGeminiParseText:
 
         assert [(i.search_query, i.quantity) for i in result.items] == [("arabica 500g", 2)]
         (call,) = fake.models.calls
-        assert call["model"] == "gemini-2.5-flash"
+        assert call["model"] == "gemini-3.5-flash"
         cfg: types.GenerateContentConfig = call["config"]
         assert cfg.response_schema is GeminiExtractionPayload
         assert cfg.response_mime_type == "application/json"
@@ -388,7 +388,7 @@ class TestGeminiParseText:
             async def generate_content(self, **_kw):
                 await asyncio.sleep(10)
 
-        parser, fake = make_parser()
+        parser, fake = make_parser(gemini_model="gemini-2.5-flash")
         fake.aio.models = SlowModels()
         parser.settings = Settings(gemini_api_key="k", gemini_timeout_seconds=0.01)
         monkeypatch.setattr(gp, "asyncio", SimpleNamespace(wait_for=_fast_wait_for))
@@ -423,7 +423,7 @@ class TestGeminiParseTextEndpoint:
         )
         use_parser(parser)
         body = client.post(TEXT_URL, json={"text": "4 bags arabica half kilo + 2 tampers"}).json()
-        assert body["parser_mode"] == "gemini" and body["model_used"] == "gemini-2.5-flash"
+        assert body["parser_mode"] == "gemini" and body["model_used"] == "gemini-3.5-flash"
         assert body["customer_note"] == "Back door delivery"
         preview = body["match_preview"]
         assert [ln["matched_sku"]["sku_code"] for ln in preview["lines"]] == [
@@ -479,14 +479,59 @@ class TestGeminiParseTextEndpoint:
     def test_upstream_errors_surface_as_json(self, client: TestClient, use_parser, error, status):
         parser, _ = make_parser(exc=error)
         use_parser(parser)
-        resp = client.post(TEXT_URL, json={"text": "2 tampers"})
+        resp = client.post(TEXT_URL, json={"text": "2 tampers", "allow_fallback": False})
         assert resp.status_code == status
         assert set(resp.json()) == {"detail", "error"}
         assert "test-key" not in resp.text
 
     def test_malformed_gemini_output_is_502(self, client: TestClient, use_parser):
         use_parser(make_parser(gemini_response(text="<html>oops</html>"))[0])
-        assert client.post(TEXT_URL, json={"text": "2 tampers"}).status_code == 502
+        assert (
+            client.post(TEXT_URL, json={"text": "2 tampers", "allow_fallback": False}).status_code
+            == 502
+        )
+
+    def test_upstream_error_falls_back_to_regex_by_default(self, client: TestClient, use_parser):
+        parser, _ = make_parser(
+            exc=genai_errors.ClientError(404, {"error": {"status": "NOT_FOUND"}})
+        )
+        use_parser(parser)
+        resp = client.post(TEXT_URL, json={"text": "2x Espresso tamper 58mm"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["parser_mode"] == "deterministic_fallback"
+        assert body["model_used"] == FALLBACK_MODEL_NAME
+        assert body["match_preview"]["lines"][0]["matched_sku"]["sku_code"] == "BPE-TMP-58MM"
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            genai_errors.ClientError(404, {"error": {"status": "NOT_FOUND"}}),
+            genai_errors.ServerError(503, {"error": {"status": "UNAVAILABLE"}}),
+        ],
+    )
+    def test_primary_model_failure_retries_fallback_gemini_model(
+        self, client: TestClient, use_parser, error
+    ):
+        class FailingPrimaryModels(FakeModels):
+            async def generate_content(self, *, model: str, contents: Any, config: Any) -> Any:
+                self.calls.append({"model": model, "contents": contents, "config": config})
+                if model == "gemini-3.5-flash":
+                    raise error
+                return gemini_response({"items": [item("espresso tamper 58mm", 2)]})
+
+        parser, fake = make_parser(gemini_model="gemini-3.5-flash")
+        fake.aio.models = FailingPrimaryModels()
+        use_parser(parser)
+        resp = client.post(TEXT_URL, json={"text": "2 tampers"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["parser_mode"] == "gemini"
+        assert body["model_used"] == "gemini-3.5-flash-lite"
+        assert [c["model"] for c in fake.aio.models.calls] == [
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+        ]
 
 
 # =============================================================================================
@@ -757,7 +802,10 @@ def test_coerce_payload_accepts_bytes_and_caps_items():
 )
 def test_live_gemini_text_extraction():
     parser = GeminiOrderParser(Settings(gemini_api_key=os.environ["CATALOGPAY_LIVE_GEMINI_KEY"]))
-    result = run(parser.parse_text("Hi! Need 3 bags of 500g arabica and 2 espresso tampers 58mm"))
+    try:
+        result = run(parser.parse_text("Hi! Need 3 bags of 500g arabica and 2 espresso tampers 58mm"))
+    except UpstreamUnavailableError as exc:
+        pytest.skip(f"Gemini upstream unavailable: {exc}")
     by_qty = sorted((i.quantity, i.search_query.lower()) for i in result.items)
     assert len(by_qty) == 2
     assert by_qty[0][0] == 2 and "tamper" in by_qty[0][1]

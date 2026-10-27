@@ -26,6 +26,12 @@ from app.schemas.order_parser import ExtractedLineItem, GeminiExtractionPayload
 logger = logging.getLogger(__name__)
 
 MAX_ITEMS: Final = 100
+FALLBACK_GEMINI_MODELS: Final[tuple[str, ...]] = (
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
+)
+# Retired model (404), per-model quota (429) or overloaded/erroring model (5xx): try the next one.
+_RETRYABLE_ON_NEXT_MODEL: Final = frozenset({404, 429, 500, 502, 503, 504})
 
 ALLOWED_MEDIA_TYPES: Final = frozenset(
     {
@@ -308,25 +314,40 @@ class GeminiOrderParser:
 
     async def _generate(self, contents: list[types.Part] | str) -> GeminiExtractionPayload:
         client = self._get_client()
-        try:
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=self.model, contents=contents, config=self._config()
-                ),
-                timeout=self.settings.gemini_timeout_seconds + 5,
-            )
-        except TimeoutError as exc:
-            raise UpstreamUnavailableError("Gemini request timed out.") from exc
-        except genai_errors.APIError as exc:
-            logger.warning("Gemini API error %s: %s", exc.code, exc.status)
-            if exc.code == 429 or (exc.code or 0) >= 500:
-                raise UpstreamUnavailableError(
-                    f"Gemini is temporarily unavailable (HTTP {exc.code})."
+        candidates = tuple(dict.fromkeys((self.model, *FALLBACK_GEMINI_MODELS)))
+        response = None
+        for idx, candidate in enumerate(candidates):
+            try:
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=candidate, contents=contents, config=self._config()
+                    ),
+                    timeout=self.settings.gemini_timeout_seconds + 5,
+                )
+                self.model = candidate
+                break
+            except TimeoutError as exc:
+                raise UpstreamUnavailableError("Gemini request timed out.") from exc
+            except genai_errors.APIError as exc:
+                if exc.code in _RETRYABLE_ON_NEXT_MODEL and idx + 1 < len(candidates):
+                    logger.warning(
+                        "Gemini model '%s' returned HTTP %s; retrying with '%s'",
+                        candidate,
+                        exc.code,
+                        candidates[idx + 1],
+                    )
+                    continue
+                logger.warning("Gemini API error %s: %s", exc.code, exc.status)
+                if exc.code == 429 or (exc.code or 0) >= 500:
+                    raise UpstreamUnavailableError(
+                        f"Gemini is temporarily unavailable (HTTP {exc.code})."
+                    ) from exc
+                raise UpstreamResponseError(
+                    f"Gemini rejected the request (HTTP {exc.code})."
                 ) from exc
-            raise UpstreamResponseError(f"Gemini rejected the request (HTTP {exc.code}).") from exc
-        except Exception as exc:  # network failures, SDK bugs
-            logger.exception("Unexpected Gemini client failure")
-            raise UpstreamUnavailableError("Could not reach Gemini.") from exc
+            except Exception as exc:  # network failures, SDK bugs
+                logger.exception("Unexpected Gemini client failure")
+                raise UpstreamUnavailableError("Could not reach Gemini.") from exc
 
         parsed = getattr(response, "parsed", None)
         if parsed is not None:

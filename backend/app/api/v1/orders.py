@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 from typing import Annotated, Final
 
@@ -40,6 +41,7 @@ from app.services.gemini_parser import (
     EmptyMediaError,
     GeminiOrderParser,
     MediaTooLargeError,
+    OrderParserError,
     ParserNotConfiguredError,
     UnsupportedMediaTypeError,
     normalize_media_type,
@@ -59,6 +61,7 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 
 FALLBACK_MODEL_NAME: Final = "deterministic-regex-v1"
 PARSE_MEDIA_PATH: Final = "/orders/parse-media"
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=4)
@@ -111,7 +114,18 @@ async def parse_text(
 ) -> ParsedOrderPreviewResponse:
     mode: ParserMode
     if parser.is_configured:
-        extraction, mode, model_used = await parser.parse_text(payload.text), "gemini", parser.model
+        try:
+            extraction = await parser.parse_text(payload.text)
+            mode, model_used = "gemini", parser.model
+        except OrderParserError:
+            if not payload.allow_fallback:
+                raise
+            logger.warning(
+                "Gemini text parsing failed; falling back to deterministic regex parser",
+                exc_info=True,
+            )
+            extraction = parse_text_deterministic_fallback(payload.text)
+            mode, model_used = "deterministic_fallback", FALLBACK_MODEL_NAME
     elif payload.allow_fallback:
         extraction = parse_text_deterministic_fallback(payload.text)
         mode, model_used = "deterministic_fallback", FALLBACK_MODEL_NAME

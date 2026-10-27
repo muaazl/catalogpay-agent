@@ -11,11 +11,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RETURN_URL = "http://localhost:5173/checkout/return"
 DEFAULT_CANCEL_URL = "http://localhost:5173/checkout/cancel"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(REPO_ROOT / ".env", REPO_ROOT / "backend" / ".env", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -47,8 +48,8 @@ class Settings(BaseSettings):
 
     # Gemini order parser. An empty key disables Gemini (text falls back to the regex parser).
     gemini_api_key: str = Field(default="", repr=False)
-    gemini_model: str = "gemini-2.5-flash"
-    gemini_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    gemini_model: str = DEFAULT_GEMINI_MODEL
+    gemini_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, ge=1, le=50 * 1024 * 1024)
 
     # PayPal. Without client credentials and with the mock fallback on, the client runs in
@@ -85,6 +86,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _derive_public_urls(self) -> "Settings":
+        self.gemini_api_key = self.gemini_api_key.strip().strip("\"'")
+        cleaned_model = self.gemini_model.strip().strip("\"'").removeprefix("models/")
+        self.gemini_model = cleaned_model or DEFAULT_GEMINI_MODEL
         # On Render the SPA is served from the service's own URL; send PayPal buyers back there.
         base = self.render_external_url.rstrip("/")
         if base:

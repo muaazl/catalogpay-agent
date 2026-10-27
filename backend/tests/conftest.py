@@ -8,8 +8,21 @@ os.environ["ENVIRONMENT"] = "test"
 os.environ["STATIC_DIST_DIR"] = os.path.join(os.path.dirname(__file__), "__no_dist__")
 os.environ["SEED_DEMO_ORDERS"] = "false"
 # Never let a developer's real key make tests hit the network; the opt-in live test reads it here.
-os.environ["CATALOGPAY_LIVE_GEMINI_KEY"] = os.environ.get("GEMINI_API_KEY", "")
+def _live_key() -> str:
+    k = os.environ.get("GEMINI_API_KEY", "").strip()
+    if k:
+        return k
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if os.path.isfile(env_path):
+        for ln in open(env_path, encoding="utf-8"):
+            if ln.strip().startswith("GEMINI_API_KEY=") and not ln.strip().startswith("#"):
+                return ln.strip().split("=", 1)[1].strip().strip("\"'")
+    return ""
+
+
+os.environ["CATALOGPAY_LIVE_GEMINI_KEY"] = _live_key()
 os.environ["GEMINI_API_KEY"] = ""
+os.environ["GEMINI_MODEL"] = "gemini-3.5-flash"
 
 from collections.abc import Iterator
 

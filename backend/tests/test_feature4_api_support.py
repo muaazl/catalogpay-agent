@@ -94,7 +94,7 @@ class TestHealthIntegrations:
         client.app.dependency_overrides[get_paypal_client] = lambda: PayPalClient(configured)
         integrations = client.get("/api/v1/health").json()["integrations"]
         assert integrations["parser_mode"] == "gemini"
-        assert integrations["parser_model"] == "gemini-2.5-flash"
+        assert integrations["parser_model"] == "gemini-3.5-flash"
         assert integrations["paypal_mode"] == "live_sandbox"
 
     def test_paypal_not_configured(self, client: TestClient):
